@@ -14,9 +14,11 @@ from models import (
     CurrentCarbonResponse, ForecastResponse, SavingsSummary,
     GridStatus,
     ScheduleResponse, ScheduledJobEntry, ScheduleSummary, ScheduleApproveRequest,
+    AnomalyReport, ForecastAccuracyResponse,
 )
 from carbon_service import get_current_carbon, get_forecast
 from grid_service import get_grid_status
+from anomaly_service import get_anomaly_report, get_accuracy_report
 from scheduler import find_optimal_window, schedule_multiple_jobs
 from llm_service import get_chat_response, get_job_recommendation, stream_chat_response
 from database import get_supabase, create_job, get_jobs, get_job, update_job, _row_to_job_response
@@ -163,6 +165,16 @@ async def current_carbon():
 @app.get("/api/carbon/forecast", response_model=ForecastResponse)
 async def carbon_forecast(hours: int = Query(default=24, ge=1, le=48)):
     return await get_forecast(hours)
+
+
+@app.get("/api/carbon/anomaly", response_model=AnomalyReport)
+async def carbon_anomaly():
+    return await get_anomaly_report()
+
+
+@app.get("/api/carbon/forecast/accuracy", response_model=ForecastAccuracyResponse)
+async def forecast_accuracy():
+    return await get_accuracy_report()
 
 
 # --- Grid ---
@@ -362,6 +374,7 @@ def _build_schedule_response(rows: list[dict], windows: dict[int, object]) -> Sc
             power_kw=row["power_kw"],
             avg_carbon_intensity=window.avg_carbon_intensity,
             estimated_savings_pct=window.estimated_savings_pct,
+            estimated_savings_tl=window.estimated_savings_tl,
             status=row["status"],
             color=_carbon_color(window.avg_carbon_intensity),
             reasoning=window.reasoning,
@@ -370,18 +383,37 @@ def _build_schedule_response(rows: list[dict], windows: dict[int, object]) -> Sc
 
     entries.sort(key=lambda e: e.start_time)
 
+    tl_values = [e.estimated_savings_tl for e in entries if e.estimated_savings_tl is not None]
+    total_cost_saved_tl = round(sum(tl_values), 2) if tl_values else None
+
     summary = ScheduleSummary(
         total_jobs=len(rows),
         scheduled_jobs=len(entries),
         total_carbon_saved_kg=round(total_saved, 3),
         total_energy_kwh=round(total_kwh, 2),
         avg_savings_pct=round(sum(savings_list) / len(savings_list), 1) if savings_list else 0.0,
+        total_cost_saved_tl=total_cost_saved_tl,
     )
     return ScheduleResponse(
         generated_at=datetime.now(tz=TURKEY_TZ),
         jobs=entries,
         summary=summary,
     )
+
+
+def _build_outage_slots(grid: GridStatus) -> set:
+    slots: set = set()
+    for outage in grid.planned_outages:
+        ts = outage.start_time
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=TURKEY_TZ)
+        end = outage.end_time
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=TURKEY_TZ)
+        while ts < end:
+            slots.add(ts)
+            ts += timedelta(hours=1)
+    return slots
 
 
 @app.get("/api/schedule", response_model=ScheduleResponse)
@@ -398,7 +430,17 @@ async def get_schedule(user_id: str = Depends(get_current_user)):
 
     current = await get_current_carbon()
     forecast = await get_forecast(24)
-    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity)
+
+    outage_slots: set = set()
+    current_ptf = None
+    try:
+        grid = await get_grid_status()
+        current_ptf = grid.ptf_tl_per_mwh
+        outage_slots = _build_outage_slots(grid)
+    except Exception:
+        pass
+
+    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity, outage_slots or None, current_ptf)
     return _build_schedule_response(active, windows)
 
 
@@ -415,7 +457,17 @@ async def approve_schedule(body: ScheduleApproveRequest, user_id: str = Depends(
 
     current = await get_current_carbon()
     forecast = await get_forecast(24)
-    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity)
+
+    outage_slots: set = set()
+    current_ptf = None
+    try:
+        grid = await get_grid_status()
+        current_ptf = grid.ptf_tl_per_mwh
+        outage_slots = _build_outage_slots(grid)
+    except Exception:
+        pass
+
+    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity, outage_slots or None, current_ptf)
 
     now = datetime.now(tz=TURKEY_TZ)
     for i, row in enumerate(active):
