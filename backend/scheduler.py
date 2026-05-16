@@ -72,7 +72,7 @@ def find_optimal_window(
     end_time = best_window[-1].timestamp + timedelta(hours=1)
     avg_carbon = round(best_avg, 1)
 
-    savings_pct = round(max(0.0, (current_intensity - avg_carbon) / current_intensity * 100), 1)
+    savings_pct = round(min(100.0, max(0.0, (current_intensity - avg_carbon) / current_intensity * 100)), 1)
 
     savings_tl = None
     if current_ptf is not None:

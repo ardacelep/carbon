@@ -42,6 +42,11 @@ TOOLS = [
             "power_kw": {"type": "number", "description": "İşin güç tüketimi kW cinsinden"},
         }, "required": ["duration_hours", "power_kw"]},
     }},
+    {"type": "function", "function": {
+        "name": "detect_anomaly",
+        "description": "Şu anki karbon yoğunluğunun saatlik geçmiş baseline'a göre anormal olup olmadığını Z-score ile tespit eder. Anomali varsa severity ve öneri döndürür.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
 ]
 
 
@@ -118,6 +123,21 @@ async def _execute_tool(name: str, arguments: str) -> dict:
             "reasoning": window.reasoning,
         }
 
+    if name == "detect_anomaly":
+        from anomaly_service import get_anomaly_report
+        r = await get_anomaly_report()
+        return {
+            "is_anomaly": r.is_anomaly,
+            "severity": r.severity,
+            "z_score": r.z_score,
+            "carbon_intensity": r.carbon_intensity,
+            "hour": r.hour,
+            "hour_mean": r.hour_mean,
+            "hour_std": r.hour_std,
+            "message": r.message,
+            "recommendation": r.recommendation,
+        }
+
     return {"error": f"Bilinmeyen araç: {name}"}
 
 
@@ -149,7 +169,8 @@ _SYSTEM_PROMPT = (
     "takip eden bir platformda çalışıyorsun.\n\n"
     "Görevin: Veri merkezi operatörlerine karbon bilinçli iş yükü zamanlaması konusunda Türkçe, "
     "net ve pratik tavsiyeler vermek.\n\n"
-    "Elinde 4 araç var: anlık karbon verisi, 24 saatlik tahmin, şebeke durumu ve en iyi pencere hesaplama. "
+    "Elinde 5 araç var: anlık karbon verisi, 24 saatlik tahmin, şebeke durumu, "
+    "en iyi pencere hesaplama ve anomali tespiti. "
     "Kullanıcı soru sorduğunda önce gerekli araçları çağır, sonra gerçek verilerle yanıt ver.\n\n"
     "Yanıtlarında:\n"
     "- Somut sayılar ver (gCO2/kWh, kg tasarruf, saat)\n"
@@ -255,6 +276,47 @@ async def stream_chat_response(
         yield "data: [DONE]\n\n"
 
 
+async def _analyze_carbon_context(
+    current_intensity: float,
+    optimal_window: OptimalWindow,
+    grid_context: dict | None,
+) -> str:
+    """
+    Pipeline Adım 1 — Serbest metin analizi.
+    Karbon koşullarını değerlendirir; çıktısı Adım 2'ye bağlam olarak geçer.
+    """
+    grid_block = _grid_context_block(grid_context)
+    start_str = optimal_window.start_time.strftime("%d.%m %H:%M")
+    end_str = optimal_window.end_time.strftime("%H:%M")
+
+    prompt = (
+        f"Türkiye elektrik şebekesi karbon analisti olarak şu verileri değerlendir:\n\n"
+        f"Anlık karbon yoğunluğu: {current_intensity:.1f} gCO2/kWh\n"
+        f"Önerilen optimal pencere: {start_str}–{end_str}\n"
+        f"Penceredeki ortalama yoğunluk: {optimal_window.avg_carbon_intensity:.1f} gCO2/kWh\n"
+        f"Tahmini tasarruf: %{optimal_window.estimated_savings_pct:.0f}"
+        f"{grid_block}\n\n"
+        "2-3 cümleyle bu zaman diliminin neden uygun olduğunu, hangi enerji kaynaklarının belirleyici "
+        "olduğunu ve dikkat edilmesi gereken riskleri belirt. Yalnızca analiz yaz."
+    )
+
+    try:
+        response = await _get_client().chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.4,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[llm_service] pipeline adım-1 hatası: {e}")
+        return optimal_window.reasoning  # scheduler reasoning ile devam et
+
+
+_RETRY_CONFIDENCE = [0.92, 0.75, 0.58]
+_RETRY_TEMPERATURES = [0.3, 0.5, 0.7]
+
+
 async def get_job_recommendation(
     job_name: str,
     duration_hours: float,
@@ -269,24 +331,29 @@ async def get_job_recommendation(
     start_str = optimal_window.start_time.strftime("%H:%M")
     end_str = optimal_window.end_time.strftime("%H:%M")
     date_str = optimal_window.start_time.strftime("%d.%m")
-
-    grid_block = _grid_context_block(grid_context)
-
     safe_name = job_name.replace("\n", " ").replace("\r", " ")[:80]
+
+    # === PIPELINE ADIM 1: Karbon bağlamını serbest metinle analiz et ===
+    context_analysis = await _analyze_carbon_context(
+        current_intensity, optimal_window, grid_context
+    )
+
+    # === PIPELINE ADIM 2: Adım 1 çıktısını bağlam olarak kullanarak yapılandırılmış öneri üret ===
     prompt = (
         f"Sen bir veri merkezi karbon optimizasyon uzmanısın.\n\n"
+        f"=== BAĞLAM ANALİZİ (Pipeline Adım 1) ===\n"
+        f"{context_analysis}\n\n"
+        f"=== İŞ DETAYLARI ===\n"
         f"İş: {safe_name} | Süre: {duration_hours} sa | Güç: {power_kw} kW\n"
         f"Şu an: {current_co2:.2f} kg CO2 | Önerilen pencerede: {optimal_co2:.2f} kg CO2\n"
         f"Tasarruf: {saving_kg:.2f} kg CO2 (%{optimal_window.estimated_savings_pct:.0f})\n"
-        f"Önerilen pencere: {date_str} {start_str}–{end_str}"
-        f"{grid_block}\n\n"
-        "Yanıtını SADECE aşağıdaki JSON formatında ver, başka hiçbir şey yazma:\n"
+        f"Önerilen pencere: {date_str} {start_str}–{end_str}\n\n"
+        "Yukarıdaki bağlam analizini referans alarak SADECE şu JSON formatında yanıt ver:\n"
         '{"window":"HH:MM–HH:MM","date":"DD.MM","savings_kg":X.X,"savings_pct":X.X,'
         '"reasoning":"kısa açıklama","action":"eylem cümlesi"}'
     )
 
-    temperatures = [0.3, 0.5, 0.7]
-    for temp in temperatures:
+    for temp, conf in zip(_RETRY_TEMPERATURES, _RETRY_CONFIDENCE):
         try:
             response = await _get_client().chat.completions.create(
                 model=MODEL_SMALL,
@@ -295,31 +362,24 @@ async def get_job_recommendation(
                 temperature=temp,
             )
             text = response.choices[0].message.content.strip()
-            # JSON bloğu varsa çıkar
             if "```" in text:
                 text = text.split("```")[1].lstrip("json").strip()
             start = text.find("{")
             end = text.rfind("}") + 1
             if start != -1 and end > start:
                 text = text[start:end]
-            rec = JobRecommendation.model_validate_json(text)
-            # Sayı tutarlılığı: LLM'in ürettiği savings değerleri
-            # hesaplananlardan ±5 puan veya ±%10 kg sapıyorsa override et
-            pct_drift = abs(rec.savings_pct - optimal_window.estimated_savings_pct)
-            kg_drift = abs(rec.savings_kg - saving_kg)
-            if pct_drift > 5.0 or kg_drift > max(0.5, abs(saving_kg) * 0.10):
-                print(
-                    f"[llm_service] sayı sapması düzeltildi — "
-                    f"savings_pct: {rec.savings_pct:.1f}→{optimal_window.estimated_savings_pct:.1f}, "
-                    f"savings_kg: {rec.savings_kg:.2f}→{saving_kg:.2f}"
-                )
-                rec = rec.model_copy(update={
-                    "savings_pct": round(optimal_window.estimated_savings_pct, 1),
-                    "savings_kg": round(saving_kg, 2),
-                })
-            return rec
+            data = json.loads(text)
+            # Grounding: LLM'in ürettiği sayıları algoritmik değerlerle sabitle.
+            # reasoning ve action LLM'den gelir; sayılar ve pencere değişmez.
+            data["savings_kg"]       = round(saving_kg, 2)
+            data["savings_pct"]      = round(optimal_window.estimated_savings_pct, 1)
+            data["window"]           = f"{start_str}–{end_str}"
+            data["date"]             = date_str
+            data["confidence"]       = conf
+            data["pipeline_context"] = context_analysis
+            return JobRecommendation.model_validate(data)
         except (ValidationError, Exception) as e:
             print(f"[llm_service] öneri parse hatası (temp={temp}): {e}")
 
-    print(f"[llm_service] 3 retry başarısız, None döndürülüyor")
+    print("[llm_service] 3 retry başarısız, None döndürülüyor")
     return None

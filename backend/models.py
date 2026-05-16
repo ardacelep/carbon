@@ -65,8 +65,8 @@ class OptimalWindow(BaseModel):
     end_time: datetime
     avg_carbon_intensity: float
     estimated_savings_pct: float
-    reasoning: str
-    estimated_savings_tl: Optional[float] = None  # ₺ elektrik maliyet tasarrufu
+    reasoning: str = Field(..., max_length=1000)
+    estimated_savings_tl: Optional[float] = None
 
 
 class ScheduledJobEntry(BaseModel):
@@ -110,8 +110,10 @@ class JobRecommendation(BaseModel):
     date: str
     savings_kg: float
     savings_pct: float
-    reasoning: str
-    action: str
+    reasoning: str = Field(..., max_length=500)
+    action: str = Field(..., max_length=300)
+    confidence: float = Field(default=0.9, ge=0.0, le=1.0, description="AI çıktı güven skoru (0-1)")
+    pipeline_context: Optional[str] = Field(None, description="Pipeline Adım 1 karbon bağlam analizi")
 
 
 class JobResponse(BaseModel):
@@ -214,3 +216,34 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user_id: str
+
+
+# --- Anomaly Detection (D5) ---
+
+class AnomalyReport(BaseModel):
+    timestamp: datetime
+    carbon_intensity: float = Field(..., description="Anlık gCO2/kWh")
+    hour: int = Field(..., ge=0, le=23)
+    z_score: float = Field(..., description="Z-skoru; negatif = baseline altında")
+    severity: str = Field(..., description="normal | low | medium | high | unknown")
+    is_anomaly: bool
+    hour_mean: Optional[float] = Field(None, description="Bu saat için baseline ortalama gCO2/kWh")
+    hour_std: Optional[float] = Field(None, description="Bu saat için baseline standart sapması")
+    sample_count: int = Field(..., description="Baseline hesabındaki gözlem sayısı")
+    message: str
+    recommendation: str
+    source: str
+    generated_at: datetime
+
+
+# --- Forecast Accuracy / Backtest (D4) ---
+
+class ForecastAccuracyResponse(BaseModel):
+    mae_gco2_kwh: float = Field(..., description="Ortalama mutlak hata (gCO2/kWh)")
+    rmse_gco2_kwh: float = Field(..., description="Kök ortalama kare hata (gCO2/kWh)")
+    train_days: int
+    test_days: int
+    train_points: int
+    test_points: int
+    model_type: str = Field(default="hourly-mean", description="Kullanılan tahmin modeli")
+    predictions: list[dict] = Field(..., description="Test seti tahmin/gerçek karşılaştırması")

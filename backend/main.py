@@ -14,9 +14,11 @@ from models import (
     CurrentCarbonResponse, ForecastResponse, SavingsSummary,
     GridStatus,
     ScheduleResponse, ScheduledJobEntry, ScheduleSummary, ScheduleApproveRequest,
+    AnomalyReport, ForecastAccuracyResponse,
 )
 from carbon_service import get_current_carbon, get_forecast
 from grid_service import get_grid_status
+from anomaly_service import get_anomaly_report, get_accuracy_report
 from scheduler import find_optimal_window, schedule_multiple_jobs
 from llm_service import get_chat_response, get_job_recommendation, stream_chat_response
 from database import get_supabase, create_job, get_jobs, get_job, update_job, _row_to_job_response
@@ -163,6 +165,16 @@ async def current_carbon():
 @app.get("/api/carbon/forecast", response_model=ForecastResponse)
 async def carbon_forecast(hours: int = Query(default=24, ge=1, le=48)):
     return await get_forecast(hours)
+
+
+@app.get("/api/carbon/anomaly", response_model=AnomalyReport)
+async def carbon_anomaly():
+    return await get_anomaly_report()
+
+
+@app.get("/api/carbon/forecast/accuracy", response_model=ForecastAccuracyResponse)
+async def forecast_accuracy():
+    return await get_accuracy_report()
 
 
 # --- Grid ---
