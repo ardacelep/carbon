@@ -12,7 +12,8 @@ load_dotenv()
 
 _client: AsyncOpenAI | None = None
 
-MODEL = "meta/llama-3.3-70b-instruct"
+MODEL = "meta/llama-3.3-70b-instruct"        # chat + function calling
+MODEL_SMALL = "meta/llama-3.1-8b-instruct"  # structured JSON output
 MAX_TOKENS = 1024
 
 TOOLS = [
@@ -270,7 +271,7 @@ async def get_job_recommendation(
     for temp in temperatures:
         try:
             response = await _get_client().chat.completions.create(
-                model=MODEL,
+                model=MODEL_SMALL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=512,
                 temperature=temp,

@@ -111,7 +111,143 @@ def schedule_multiple_jobs(
     forecast: ForecastResponse,
     current_intensity: float,
 ) -> dict[int, OptimalWindow]:
-    # Öncelik azalan, deadline artan sırada işle (None deadline = sonsuz)
+    try:
+        result = _schedule_ortools(jobs, forecast, current_intensity)
+        print(f"[scheduler] OR-Tools: {len(result)}/{len(jobs)} iş planlandı")
+        return result
+    except Exception as e:
+        print(f"[scheduler] OR-Tools başarısız ({e}), greedy fallback devreye giriyor")
+        return _schedule_greedy(jobs, forecast, current_intensity)
+
+
+def _schedule_ortools(
+    jobs: list[dict],
+    forecast: ForecastResponse,
+    current_intensity: float,
+) -> dict[int, OptimalWindow]:
+    from ortools.sat.python import cp_model
+
+    points = forecast.points
+    n_slots = len(points)
+    if n_slots == 0 or not jobs:
+        return {}
+
+    model = cp_model.CpModel()
+    job_vars: dict[int, dict] = {}
+
+    for job in jobs:
+        job_id = job["id"]
+        duration = max(1, math.ceil(job["duration_hours"]))
+
+        # Deadline'a göre son geçerli başlangıç slotunu hesapla
+        max_start = n_slots - duration
+        if job.get("deadline"):
+            try:
+                deadline = job["deadline"]
+                if isinstance(deadline, str):
+                    deadline = datetime.fromisoformat(deadline)
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=TURKEY_TZ)
+                for i, p in enumerate(points):
+                    ts = p.timestamp if p.timestamp.tzinfo else p.timestamp.replace(tzinfo=TURKEY_TZ)
+                    if ts >= deadline:
+                        max_start = min(max_start, max(0, i - duration))
+                        break
+            except Exception:
+                pass
+
+        max_start = max(0, max_start)
+
+        # Her başlangıç slotu için karbon maliyeti (tamsayı, 10x ölçekli)
+        SCALE = 10
+        costs = []
+        for s in range(max_start + 1):
+            window_pts = points[s: s + duration]
+            avg_ci = sum(p.carbon_intensity for p in window_pts) / len(window_pts) if window_pts else current_intensity
+            costs.append(int(avg_ci * SCALE))
+
+        if not costs:
+            continue
+
+        start = model.NewIntVar(0, max_start, f"s_{job_id}")
+        interval = model.NewFixedSizeIntervalVar(start, duration, f"i_{job_id}")
+        carbon = model.NewIntVar(min(costs), max(costs) + 1, f"c_{job_id}")
+        model.AddElement(start, costs, carbon)
+
+        job_vars[job_id] = {
+            "start": start,
+            "interval": interval,
+            "carbon": carbon,
+            "duration": duration,
+            "costs": costs,
+        }
+
+    if not job_vars:
+        return {}
+
+    # Çakışma yasağı
+    model.AddNoOverlap([v["interval"] for v in job_vars.values()])
+
+    # Amaç: toplam karbonu minimize et (önceliğe göre ağırlıklı)
+    obj = []
+    for job in jobs:
+        jid = job["id"]
+        if jid not in job_vars:
+            continue
+        weight = max(1, 6 - job.get("priority", 1))
+        obj.append(job_vars[jid]["carbon"] * weight)
+    model.Minimize(sum(obj))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 5.0
+    status = solver.Solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError(f"Çözüm bulunamadı (status={status})")
+
+    result: dict[int, OptimalWindow] = {}
+    for job in jobs:
+        jid = job["id"]
+        if jid not in job_vars:
+            continue
+
+        s = solver.Value(job_vars[jid]["start"])
+        dur = job_vars[jid]["duration"]
+        window_pts = points[s: s + dur]
+
+        avg_ci = sum(p.carbon_intensity for p in window_pts) / len(window_pts) if window_pts else current_intensity
+        avg_ci = round(avg_ci, 1)
+        savings_pct = round(max(0.0, (current_intensity - avg_ci) / current_intensity * 100), 1) if current_intensity > 0 else 0.0
+
+        start_time = points[s].timestamp
+        end_time = points[min(s + dur - 1, n_slots - 1)].timestamp + timedelta(hours=1)
+
+        hours_in = [p.timestamp.hour for p in window_pts]
+        note = ""
+        if any(10 <= h <= 15 for h in hours_in):
+            note = " Güneş üretiminin yüksek olduğu öğle saatlerinden yararlanıyor."
+        elif all(h < 6 or h >= 22 for h in hours_in):
+            note = " Düşük talebin olduğu gece saatlerinde yenilenebilir oran artıyor."
+
+        result[jid] = OptimalWindow(
+            start_time=start_time,
+            end_time=end_time,
+            avg_carbon_intensity=avg_ci,
+            estimated_savings_pct=savings_pct,
+            reasoning=(
+                f"Global optimizasyon: {start_time.strftime('%d.%m %H:%M')}–{end_time.strftime('%H:%M')}, "
+                f"ortalama {avg_ci} gCO₂/kWh — şu anki değerden %{savings_pct:.0f} tasarruf.{note}"
+            ),
+        )
+
+    return result
+
+
+def _schedule_greedy(
+    jobs: list[dict],
+    forecast: ForecastResponse,
+    current_intensity: float,
+) -> dict[int, OptimalWindow]:
     _INF = datetime.max.replace(tzinfo=TURKEY_TZ)
     sorted_jobs = sorted(
         jobs,
@@ -122,19 +258,13 @@ def schedule_multiple_jobs(
     results: dict[int, OptimalWindow] = {}
 
     for job in sorted_jobs:
-        available_points = [p for p in forecast.points if p.timestamp not in used_slots]
-        if not available_points:
+        available = [p for p in forecast.points if p.timestamp not in used_slots]
+        if not available:
             continue
-
-        filtered_forecast = ForecastResponse(
-            generated_at=forecast.generated_at,
-            source=forecast.source,
-            points=available_points,
-        )
-
+        filtered = ForecastResponse(generated_at=forecast.generated_at, source=forecast.source, points=available)
         try:
             window = find_optimal_window(
-                forecast=filtered_forecast,
+                forecast=filtered,
                 duration_hours=job["duration_hours"],
                 deadline=job.get("deadline"),
                 power_kw=job["power_kw"],
@@ -146,6 +276,6 @@ def schedule_multiple_jobs(
                 if window.start_time <= p.timestamp < window.end_time:
                     used_slots.add(p.timestamp)
         except Exception as e:
-            print(f"[scheduler] job {job['id']} için slot bulunamadı: {e}")
+            print(f"[scheduler] greedy: job {job['id']} planlanamadı: {e}")
 
     return results
