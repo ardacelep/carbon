@@ -11,7 +11,7 @@ from models import CarbonReading, ForecastPoint, ForecastResponse
 TURKEY_TZ = timezone(timedelta(hours=3))
 CURRENT_TTL = 900    # 15 dakika
 FORECAST_TTL = 1800  # 30 dakika
-API_TIMEOUT = 3.0    # saniye — bu süreyi aşarsa JSON fallback devreye girer
+API_TIMEOUT = float(os.getenv("API_TIMEOUT", "12.0"))  # saniye — EPİAŞ 5-15s sürebilir
 
 FALLBACK_JSON = Path(__file__).parent / "mock_epias_data.json"
 

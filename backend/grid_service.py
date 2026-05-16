@@ -63,14 +63,14 @@ def _fetch_grid_status_live() -> GridStatus:
         dam_data = client.call("dams-active-fullness", postprocess=False)
         items = _parse_items(dam_data)
         if items:
-            values = [float(item.get("activeFullness") or item.get("value") or 0.0) for item in items if item.get("activeFullness") or item.get("value")]
+            values = [
+                float(item["activeFullnessAmount"])
+                for item in items
+                if item.get("activeFullnessAmount") is not None
+            ]
             if values:
                 dam_fullness_pct = round(sum(values) / len(values), 1)
-                if len(values) >= 2:
-                    diff = values[-1] - values[-2]
-                    dam_trend = "increasing" if diff > 0.5 else "declining" if diff < -0.5 else "stable"
-                else:
-                    dam_trend = "stable"
+                dam_trend = "stable"
     except Exception as e:
         print(f"[grid_service] baraj verisi hatası: {e}")
 
@@ -87,36 +87,44 @@ def _fetch_grid_status_live() -> GridStatus:
     except Exception as e:
         print(f"[grid_service] PTF verisi hatası: {e}")
 
-    # 3. Arz-talep dengesi
+    # 3. Arz-talep dengesi (GÖP - gün öncesi piyasası)
     supply_demand_mw = None
     try:
-        sd_start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:00:00+03:00")
-        sd_end = now.strftime("%Y-%m-%dT%H:00:00+03:00")
-        sd_data = client.call("supply-demand", postprocess=False, start_date=sd_start, end_date=sd_end)
+        today_str = now.strftime("%Y-%m-%dT00:00:00+03:00")
+        sd_data = client.call("supply-demand", postprocess=False, date_time=today_str)
         items = _parse_items(sd_data)
         if items:
-            last = items[-1]
-            supply = float(last.get("supply") or last.get("totalSupply") or 0.0)
-            demand = float(last.get("demand") or last.get("totalDemand") or 0.0)
-            if supply > 0 or demand > 0:
+            # Son saatin verisini al
+            now_h = now.hour
+            item = next(
+                (i for i in reversed(items)
+                 if datetime.fromisoformat(str(i["date"]).replace("Z", "+00:00")).astimezone(TURKEY_TZ).hour <= now_h),
+                items[-1]
+            )
+            supply = float(item.get("supply") or 0.0)
+            demand = float(item.get("demand") or 0.0)
+            if supply != 0 or demand != 0:
                 supply_demand_mw = round(supply - demand, 1)
     except Exception as e:
         print(f"[grid_service] arz-talep verisi hatası: {e}")
 
-    # 4. Planlı kesintiler
+    # 4. Planlı kesintiler (dağıtım seviyesi)
     planned_outages: list[PlannedOutage] = []
     try:
-        outage_start = now.strftime("%Y-%m-%dT00:00:00+03:00")
-        outage_end = (now + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59+03:00")
-        po_data = client.call("planned-outages", postprocess=False, start_date=outage_start, end_date=outage_end)
+        period_str = now.strftime("%Y-%m-01T00:00:00+03:00")
+        po_data = client.call("planned-outages", postprocess=False, period=period_str)
         items = _parse_items(po_data)
-        for item in items[:20]:  # maksimum 20 kesinti
+        for item in items[:20]:
             try:
+                start = item.get("startTime") or item.get("start") or ""
+                end = item.get("endTime") or item.get("end") or ""
+                if not start or not end:
+                    continue
                 planned_outages.append(PlannedOutage(
-                    plant_name=item.get("powerPlantName") or item.get("name") or "Bilinmiyor",
-                    start_time=datetime.fromisoformat(item.get("startDate") or item.get("start") or ""),
-                    end_time=datetime.fromisoformat(item.get("endDate") or item.get("end") or ""),
-                    capacity_mw=float(item.get("capacity") or item.get("capacityMw") or 0.0),
+                    plant_name=f"{item.get('distributionCompanyName', '')} / {item.get('district', 'Bilinmiyor')}",
+                    start_time=datetime.fromisoformat(str(start).replace("Z", "+00:00")),
+                    end_time=datetime.fromisoformat(str(end).replace("Z", "+00:00")),
+                    capacity_mw=float(item.get("hourlyLoadAvg") or 0.0),
                 ))
             except Exception:
                 continue
@@ -180,8 +188,15 @@ async def get_grid_status() -> GridStatus:
         _cache_set("grid_status", result, GRID_TTL)
         return result
 
+    _timeout = float(os.getenv("API_TIMEOUT", "12.0"))
     try:
-        result = await asyncio.to_thread(_fetch_grid_status_live)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_fetch_grid_status_live),
+            timeout=_timeout,
+        )
+    except asyncio.TimeoutError:
+        print(f"[grid_service] EPİAŞ {_timeout}s timeout — mock kullanılıyor")
+        result = _generate_mock_grid_status()
     except Exception as e:
         print(f"[grid_service] get_grid_status hatası, mock kullanılıyor: {e}")
         result = _generate_mock_grid_status()

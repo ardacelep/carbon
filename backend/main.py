@@ -611,6 +611,41 @@ async def savings_summary(user_id: str = Depends(get_current_user)):
     )
 
 
+# --- Debug ---
+
+@app.get("/api/debug/data-sources")
+async def debug_data_sources():
+    """Anlık veri kaynağı durumunu gösterir — mock mu, gerçek EPİAŞ mı?"""
+    import carbon_service as cs
+    import grid_service as gs
+
+    carbon = await get_current_carbon()
+    forecast = await get_forecast(24)
+    grid = await get_grid_status()
+
+    return {
+        "mock_mode": os.getenv("MOCK_MODE", "false"),
+        "api_timeout_s": float(os.getenv("API_TIMEOUT", "12.0")),
+        "carbon_current": {
+            "source": carbon.source,
+            "carbon_intensity": carbon.carbon_intensity,
+        },
+        "forecast": {
+            "source": forecast.source,
+            "points": len(forecast.points),
+            "first_ptf": forecast.points[0].ptf_tl_per_mwh if forecast.points else None,
+        },
+        "grid": {
+            "source": grid.source,
+            "ptf_tl_per_mwh": grid.ptf_tl_per_mwh,
+            "dam_fullness_pct": grid.dam_fullness_pct,
+        },
+        "fallback_json_exists": (
+            __import__("pathlib").Path(__file__).parent / "mock_epias_data.json"
+        ).exists(),
+    }
+
+
 # --- Swagger Bearer Auth ---
 
 def custom_openapi():
