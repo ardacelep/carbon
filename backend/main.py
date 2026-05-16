@@ -44,7 +44,7 @@ app.add_middleware(
     allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "ngrok-skip-browser-warning"],
 )
 
 
@@ -92,14 +92,19 @@ async def _auto_progress_jobs():
 
 # --- Auth Dependency ---
 
-async def get_current_user(authorization: str = Header(...)) -> str:
+class UserContext:
+    def __init__(self, user_id: str, token: str):
+        self.user_id = user_id
+        self.token = token
+
+async def get_current_user(authorization: str = Header(...)) -> UserContext:
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Bearer token gerekli")
     token = authorization.removeprefix("Bearer ").strip()
     try:
         supabase = await get_supabase()
         user_response = await supabase.auth.get_user(token)
-        return str(user_response.user.id)
+        return UserContext(user_id=str(user_response.user.id), token=token)
     except Exception:
         raise HTTPException(status_code=401, detail="Geçersiz veya süresi dolmuş token")
 
@@ -187,7 +192,7 @@ async def grid_status():
 # --- Jobs ---
 
 @app.post("/api/jobs", response_model=JobResponse, status_code=201)
-async def create_job_endpoint(body: JobCreate, user_id: str = Depends(get_current_user)):
+async def create_job_endpoint(body: JobCreate, ctx: UserContext = Depends(get_current_user)):
     current = await get_current_carbon()
     forecast = await get_forecast(24)
 
@@ -231,13 +236,13 @@ async def create_job_endpoint(body: JobCreate, user_id: str = Depends(get_curren
         except Exception as e:
             print(f"[main] LLM hatası: {e}")
 
-    row = await create_job(user_id, body, optimal_window, ai_rec)
+    row = await create_job(ctx.user_id, body, optimal_window, ai_rec)
     return _row_to_job_response(row)
 
 
 @app.get("/api/jobs", response_model=JobListResponse)
-async def list_jobs(user_id: str = Depends(get_current_user)):
-    rows = await get_jobs(user_id)
+async def list_jobs(ctx: UserContext = Depends(get_current_user)):
+    rows = await get_jobs(ctx.user_id)
     jobs = [_row_to_job_response(r) for r in rows]
     return JobListResponse(jobs=jobs, total=len(jobs))
 
@@ -248,25 +253,25 @@ async def get_job_templates():
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobResponse)
-async def get_job_endpoint(job_id: int, user_id: str = Depends(get_current_user)):
-    row = await get_job(job_id, user_id)
+async def get_job_endpoint(job_id: int, ctx: UserContext = Depends(get_current_user)):
+    row = await get_job(job_id, ctx.user_id)
     if not row:
         raise HTTPException(status_code=404, detail="İş bulunamadı")
     return _row_to_job_response(row)
 
 
 @app.delete("/api/jobs/{job_id}")
-async def delete_job_endpoint(job_id: int, user_id: str = Depends(get_current_user)):
-    row = await get_job(job_id, user_id)
+async def delete_job_endpoint(job_id: int, ctx: UserContext = Depends(get_current_user)):
+    row = await get_job(job_id, ctx.user_id)
     if not row:
         raise HTTPException(status_code=404, detail="İş bulunamadı")
     supabase = await get_supabase()
-    await supabase.table("jobs").delete().eq("id", job_id).eq("user_id", user_id).execute()
+    await supabase.table("jobs").delete().eq("id", job_id).eq("user_id", ctx.user_id).execute()
     return {"deleted": True}
 
 
 @app.post("/api/jobs/analyze", response_model=JobAnalyzeResponse)
-async def analyze_job(body: JobAnalyzeRequest, user_id: str = Depends(get_current_user)):
+async def analyze_job(body: JobAnalyzeRequest, ctx: UserContext = Depends(get_current_user)):
     current = await get_current_carbon()
     forecast = await get_forecast(24)
 
@@ -328,8 +333,8 @@ async def analyze_job(body: JobAnalyzeRequest, user_id: str = Depends(get_curren
 
 
 @app.patch("/api/jobs/{job_id}/status", response_model=JobResponse)
-async def update_job_status(job_id: int, body: JobStatusUpdate, user_id: str = Depends(get_current_user)):
-    row = await update_job(job_id, user_id, {"status": body.status})
+async def update_job_status(job_id: int, body: JobStatusUpdate, ctx: UserContext = Depends(get_current_user)):
+    row = await update_job(job_id, ctx.user_id, {"status": body.status})
     if not row:
         raise HTTPException(status_code=404, detail="İş bulunamadı")
     return _row_to_job_response(row)
@@ -417,8 +422,8 @@ def _build_outage_slots(grid: GridStatus) -> set:
 
 
 @app.get("/api/schedule", response_model=ScheduleResponse)
-async def get_schedule(user_id: str = Depends(get_current_user)):
-    rows = await get_jobs(user_id)
+async def get_schedule(ctx: UserContext = Depends(get_current_user)):
+    rows = await get_jobs(ctx.user_id)
     active = [r for r in rows if r["status"] in ("pending", "scheduled")]
     if not active:
         return ScheduleResponse(
@@ -445,8 +450,8 @@ async def get_schedule(user_id: str = Depends(get_current_user)):
 
 
 @app.post("/api/schedule/approve", response_model=ScheduleResponse)
-async def approve_schedule(body: ScheduleApproveRequest, user_id: str = Depends(get_current_user)):
-    rows = await get_jobs(user_id)
+async def approve_schedule(body: ScheduleApproveRequest, ctx: UserContext = Depends(get_current_user)):
+    rows = await get_jobs(ctx.user_id)
     active = [r for r in rows if r["status"] in ("pending", "scheduled")]
 
     if body.job_ids:
@@ -479,9 +484,9 @@ async def approve_schedule(body: ScheduleApproveRequest, user_id: str = Depends(
             start = now + timedelta(seconds=15 + i * 90)
         else:
             start = window.start_time
-        await update_job(row["id"], user_id, {"scheduled_start": start.isoformat(), "status": "scheduled"})
+        await update_job(row["id"], ctx.user_id, {"scheduled_start": start.isoformat(), "status": "scheduled"})
 
-    updated_rows = await get_jobs(user_id)
+    updated_rows = await get_jobs(ctx.user_id)
     active_updated = [r for r in updated_rows if r["id"] in {r["id"] for r in active}]
     return _build_schedule_response(active_updated, windows)
 
@@ -504,7 +509,7 @@ DEMO_JOB_TEMPLATES = [
 
 
 @app.post("/api/schedule/demo", response_model=ScheduleResponse)
-async def demo_schedule(user_id: str = Depends(get_current_user)):
+async def demo_schedule(ctx: UserContext = Depends(get_current_user)):
     current = await get_current_carbon()
     forecast = await get_forecast(24)
 
@@ -523,7 +528,7 @@ async def demo_schedule(user_id: str = Depends(get_current_user)):
             )
         except Exception:
             pass
-        row = await create_job(user_id, job_body, window, None)
+        row = await create_job(ctx.user_id, job_body, window, None)
         created_rows.append(row)
 
     active = [r for r in created_rows if r["status"] in ("pending", "scheduled")]
@@ -535,9 +540,9 @@ async def demo_schedule(user_id: str = Depends(get_current_user)):
         if not window:
             continue
         start = now + timedelta(seconds=15 + i * 90)
-        await update_job(row["id"], user_id, {"scheduled_start": start.isoformat(), "status": "scheduled"})
+        await update_job(row["id"], ctx.user_id, {"scheduled_start": start.isoformat(), "status": "scheduled"})
 
-    updated = await get_jobs(user_id)
+    updated = await get_jobs(ctx.user_id)
     created_ids = {r["id"] for r in created_rows}
     active_updated = [r for r in updated if r["id"] in created_ids]
     return _build_schedule_response(active_updated, windows)
@@ -546,14 +551,14 @@ async def demo_schedule(user_id: str = Depends(get_current_user)):
 # --- Chat ---
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
+async def chat(body: ChatRequest, ctx: UserContext = Depends(get_current_user)):
     history_dicts = [{"role": m.role, "content": m.content} for m in body.history]
-    reply = await get_chat_response(body.message, history_dicts, {}, user_id=user_id)
+    reply = await get_chat_response(body.message, history_dicts, {}, user_id=ctx.user_id)
     return ChatResponse(reply=reply, timestamp=datetime.now(tz=TURKEY_TZ))
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(body: ChatRequest, user_id: str = Depends(get_current_user)):
+async def chat_stream(body: ChatRequest, ctx: UserContext = Depends(get_current_user)):
     history_dicts = [{"role": m.role, "content": m.content} for m in body.history]
 
     return StreamingResponse(
@@ -569,8 +574,8 @@ async def chat_stream(body: ChatRequest, user_id: str = Depends(get_current_user
 # --- Savings ---
 
 @app.get("/api/savings/summary", response_model=SavingsSummary)
-async def savings_summary(user_id: str = Depends(get_current_user)):
-    rows = await get_jobs(user_id)
+async def savings_summary(ctx: UserContext = Depends(get_current_user)):
+    rows = await get_jobs(ctx.user_id)
 
     if not rows:
         return SavingsSummary(
