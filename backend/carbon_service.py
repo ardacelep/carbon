@@ -44,14 +44,14 @@ SOLAR_CURVE: dict[int, float] = {
 }
 
 _MOCK_BASELINE: dict[str, float] = {
-    "naturalGas": 6200.0, "dammedHydro": 13000.0, "lignite": 3100.0,
+    "naturalGas": 6200.0, "dammedHydro": 8000.0, "lignite": 13000.0,
     "river": 5600.0, "importCoal": 1300.0, "wind": 2300.0, "sun": 0.0,
     "fueloil": 1.0, "geothermal": 1100.0, "asphaltiteCoal": 180.0,
     "blackCoal": 580.0, "biomass": 530.0, "naphta": 0.0,
     "lng": 0.0, "importExport": -250.0, "wasteheat": 75.0,
 }
 
-_SOLAR_PEAK_MOCK = 5000.0  # Mayıs Türkiye tahmini MW
+_SOLAR_PEAK_MOCK = 15000.0  # Mayıs Türkiye tahmini MW (güneş dominant saatler için)
 
 # Türkiye şebekesi için beklenen karbon yoğunluğu aralığı (gCO₂/kWh)
 _CARBON_VALID_RANGE = (50.0, 800.0)
