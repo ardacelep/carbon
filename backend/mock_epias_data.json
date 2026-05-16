@@ -1,0 +1,331 @@
+{
+  "generated_at": "2026-05-16T06:00:00+03:00",
+  "source": "epias",
+  "description": "EPİAŞ rt-gen verisinden hesaplanmış gerçek karbon yoğunluğu — offline fallback",
+  "points": [
+    {
+      "timestamp": "2026-05-14T00:00:00+03:00",
+      "carbon_intensity": 231.3,
+      "renewable_ratio": 0.712,
+      "total_mwh": 36575.6
+    },
+    {
+      "timestamp": "2026-05-14T01:00:00+03:00",
+      "carbon_intensity": 232.8,
+      "renewable_ratio": 0.713,
+      "total_mwh": 34920.4
+    },
+    {
+      "timestamp": "2026-05-14T02:00:00+03:00",
+      "carbon_intensity": 236.0,
+      "renewable_ratio": 0.713,
+      "total_mwh": 33510.2
+    },
+    {
+      "timestamp": "2026-05-14T03:00:00+03:00",
+      "carbon_intensity": 234.8,
+      "renewable_ratio": 0.719,
+      "total_mwh": 32743.2
+    },
+    {
+      "timestamp": "2026-05-14T04:00:00+03:00",
+      "carbon_intensity": 242.5,
+      "renewable_ratio": 0.704,
+      "total_mwh": 32558.2
+    },
+    {
+      "timestamp": "2026-05-14T05:00:00+03:00",
+      "carbon_intensity": 253.8,
+      "renewable_ratio": 0.684,
+      "total_mwh": 31992.5
+    },
+    {
+      "timestamp": "2026-05-14T06:00:00+03:00",
+      "carbon_intensity": 266.7,
+      "renewable_ratio": 0.668,
+      "total_mwh": 30383.1
+    },
+    {
+      "timestamp": "2026-05-14T07:00:00+03:00",
+      "carbon_intensity": 272.0,
+      "renewable_ratio": 0.661,
+      "total_mwh": 29960.1
+    },
+    {
+      "timestamp": "2026-05-14T08:00:00+03:00",
+      "carbon_intensity": 272.9,
+      "renewable_ratio": 0.649,
+      "total_mwh": 31743.4
+    },
+    {
+      "timestamp": "2026-05-14T09:00:00+03:00",
+      "carbon_intensity": 288.6,
+      "renewable_ratio": 0.618,
+      "total_mwh": 31157.0
+    },
+    {
+      "timestamp": "2026-05-14T10:00:00+03:00",
+      "carbon_intensity": 292.9,
+      "renewable_ratio": 0.612,
+      "total_mwh": 30005.2
+    },
+    {
+      "timestamp": "2026-05-14T11:00:00+03:00",
+      "carbon_intensity": 293.7,
+      "renewable_ratio": 0.607,
+      "total_mwh": 30131.3
+    },
+    {
+      "timestamp": "2026-05-14T12:00:00+03:00",
+      "carbon_intensity": 283.6,
+      "renewable_ratio": 0.631,
+      "total_mwh": 29659.3
+    },
+    {
+      "timestamp": "2026-05-14T13:00:00+03:00",
+      "carbon_intensity": 276.6,
+      "renewable_ratio": 0.631,
+      "total_mwh": 31670.0
+    },
+    {
+      "timestamp": "2026-05-14T14:00:00+03:00",
+      "carbon_intensity": 264.4,
+      "renewable_ratio": 0.644,
+      "total_mwh": 34799.0
+    },
+    {
+      "timestamp": "2026-05-14T15:00:00+03:00",
+      "carbon_intensity": 259.7,
+      "renewable_ratio": 0.649,
+      "total_mwh": 36200.1
+    },
+    {
+      "timestamp": "2026-05-14T16:00:00+03:00",
+      "carbon_intensity": 252.1,
+      "renewable_ratio": 0.66,
+      "total_mwh": 38044.3
+    },
+    {
+      "timestamp": "2026-05-14T17:00:00+03:00",
+      "carbon_intensity": 242.4,
+      "renewable_ratio": 0.672,
+      "total_mwh": 40261.7
+    },
+    {
+      "timestamp": "2026-05-14T18:00:00+03:00",
+      "carbon_intensity": 253.1,
+      "renewable_ratio": 0.653,
+      "total_mwh": 40588.4
+    },
+    {
+      "timestamp": "2026-05-14T19:00:00+03:00",
+      "carbon_intensity": 260.4,
+      "renewable_ratio": 0.641,
+      "total_mwh": 41646.1
+    },
+    {
+      "timestamp": "2026-05-14T20:00:00+03:00",
+      "carbon_intensity": 257.8,
+      "renewable_ratio": 0.639,
+      "total_mwh": 43068.2
+    },
+    {
+      "timestamp": "2026-05-14T21:00:00+03:00",
+      "carbon_intensity": 264.1,
+      "renewable_ratio": 0.631,
+      "total_mwh": 42117.7
+    },
+    {
+      "timestamp": "2026-05-14T22:00:00+03:00",
+      "carbon_intensity": 268.2,
+      "renewable_ratio": 0.63,
+      "total_mwh": 40226.8
+    },
+    {
+      "timestamp": "2026-05-14T23:00:00+03:00",
+      "carbon_intensity": 260.5,
+      "renewable_ratio": 0.646,
+      "total_mwh": 38626.2
+    },
+    {
+      "timestamp": "2026-05-15T00:00:00+03:00",
+      "carbon_intensity": 250.2,
+      "renewable_ratio": 0.664,
+      "total_mwh": 36603.7
+    },
+    {
+      "timestamp": "2026-05-15T01:00:00+03:00",
+      "carbon_intensity": 249.4,
+      "renewable_ratio": 0.668,
+      "total_mwh": 34879.5
+    },
+    {
+      "timestamp": "2026-05-15T02:00:00+03:00",
+      "carbon_intensity": 248.0,
+      "renewable_ratio": 0.679,
+      "total_mwh": 33452.8
+    },
+    {
+      "timestamp": "2026-05-15T03:00:00+03:00",
+      "carbon_intensity": 244.8,
+      "renewable_ratio": 0.691,
+      "total_mwh": 32695.4
+    },
+    {
+      "timestamp": "2026-05-15T04:00:00+03:00",
+      "carbon_intensity": 243.1,
+      "renewable_ratio": 0.694,
+      "total_mwh": 32583.7
+    },
+    {
+      "timestamp": "2026-05-15T05:00:00+03:00",
+      "carbon_intensity": 251.4,
+      "renewable_ratio": 0.68,
+      "total_mwh": 32212.6
+    },
+    {
+      "timestamp": "2026-05-15T06:00:00+03:00",
+      "carbon_intensity": 262.5,
+      "renewable_ratio": 0.663,
+      "total_mwh": 31037.7
+    },
+    {
+      "timestamp": "2026-05-15T07:00:00+03:00",
+      "carbon_intensity": 272.4,
+      "renewable_ratio": 0.644,
+      "total_mwh": 31034.3
+    },
+    {
+      "timestamp": "2026-05-15T08:00:00+03:00",
+      "carbon_intensity": 269.1,
+      "renewable_ratio": 0.639,
+      "total_mwh": 33594.0
+    },
+    {
+      "timestamp": "2026-05-15T09:00:00+03:00",
+      "carbon_intensity": 285.7,
+      "renewable_ratio": 0.617,
+      "total_mwh": 33067.4
+    },
+    {
+      "timestamp": "2026-05-15T10:00:00+03:00",
+      "carbon_intensity": 297.6,
+      "renewable_ratio": 0.602,
+      "total_mwh": 31992.0
+    },
+    {
+      "timestamp": "2026-05-15T11:00:00+03:00",
+      "carbon_intensity": 288.8,
+      "renewable_ratio": 0.613,
+      "total_mwh": 32418.6
+    },
+    {
+      "timestamp": "2026-05-15T12:00:00+03:00",
+      "carbon_intensity": 296.6,
+      "renewable_ratio": 0.611,
+      "total_mwh": 29389.7
+    },
+    {
+      "timestamp": "2026-05-15T13:00:00+03:00",
+      "carbon_intensity": 285.0,
+      "renewable_ratio": 0.633,
+      "total_mwh": 29225.6
+    },
+    {
+      "timestamp": "2026-05-15T14:00:00+03:00",
+      "carbon_intensity": 272.9,
+      "renewable_ratio": 0.638,
+      "total_mwh": 31985.4
+    },
+    {
+      "timestamp": "2026-05-15T15:00:00+03:00",
+      "carbon_intensity": 272.8,
+      "renewable_ratio": 0.636,
+      "total_mwh": 32399.1
+    },
+    {
+      "timestamp": "2026-05-15T16:00:00+03:00",
+      "carbon_intensity": 263.2,
+      "renewable_ratio": 0.65,
+      "total_mwh": 34682.9
+    },
+    {
+      "timestamp": "2026-05-15T17:00:00+03:00",
+      "carbon_intensity": 261.0,
+      "renewable_ratio": 0.643,
+      "total_mwh": 37389.8
+    },
+    {
+      "timestamp": "2026-05-15T18:00:00+03:00",
+      "carbon_intensity": 264.9,
+      "renewable_ratio": 0.635,
+      "total_mwh": 39522.3
+    },
+    {
+      "timestamp": "2026-05-15T19:00:00+03:00",
+      "carbon_intensity": 273.0,
+      "renewable_ratio": 0.622,
+      "total_mwh": 41373.7
+    },
+    {
+      "timestamp": "2026-05-15T20:00:00+03:00",
+      "carbon_intensity": 261.9,
+      "renewable_ratio": 0.635,
+      "total_mwh": 42933.6
+    },
+    {
+      "timestamp": "2026-05-15T21:00:00+03:00",
+      "carbon_intensity": 265.4,
+      "renewable_ratio": 0.629,
+      "total_mwh": 42240.5
+    },
+    {
+      "timestamp": "2026-05-15T22:00:00+03:00",
+      "carbon_intensity": 270.9,
+      "renewable_ratio": 0.626,
+      "total_mwh": 40189.6
+    },
+    {
+      "timestamp": "2026-05-15T23:00:00+03:00",
+      "carbon_intensity": 258.9,
+      "renewable_ratio": 0.648,
+      "total_mwh": 37835.6
+    },
+    {
+      "timestamp": "2026-05-16T00:00:00+03:00",
+      "carbon_intensity": 237.8,
+      "renewable_ratio": 0.673,
+      "total_mwh": 35592.8
+    },
+    {
+      "timestamp": "2026-05-16T01:00:00+03:00",
+      "carbon_intensity": 236.3,
+      "renewable_ratio": 0.683,
+      "total_mwh": 33712.5
+    },
+    {
+      "timestamp": "2026-05-16T02:00:00+03:00",
+      "carbon_intensity": 225.5,
+      "renewable_ratio": 0.712,
+      "total_mwh": 32099.8
+    },
+    {
+      "timestamp": "2026-05-16T03:00:00+03:00",
+      "carbon_intensity": 222.0,
+      "renewable_ratio": 0.714,
+      "total_mwh": 29861.1
+    },
+    {
+      "timestamp": "2026-05-16T04:00:00+03:00",
+      "carbon_intensity": 215.3,
+      "renewable_ratio": 0.728,
+      "total_mwh": 29337.0
+    },
+    {
+      "timestamp": "2026-05-16T05:00:00+03:00",
+      "carbon_intensity": 255.7,
+      "renewable_ratio": 0.735,
+      "total_mwh": 14396.8
+    }
+  ]
+}

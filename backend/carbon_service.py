@@ -1,14 +1,19 @@
 import asyncio
+import json
 import os
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from models import CarbonReading, ForecastPoint, ForecastResponse
 
 TURKEY_TZ = timezone(timedelta(hours=3))
 CURRENT_TTL = 900    # 15 dakika
 FORECAST_TTL = 1800  # 30 dakika
+API_TIMEOUT = 3.0    # saniye — bu süreyi aşarsa JSON fallback devreye girer
+
+FALLBACK_JSON = Path(__file__).parent / "mock_epias_data.json"
 
 EMISSION_FACTORS: dict[str, float] = {
     "naturalGas":     490,
@@ -111,6 +116,70 @@ def _parse_items(data: dict) -> list[dict]:
     if not items:
         raise ValueError("EPİAŞ boş items listesi döndü")
     return items
+
+
+# --- JSON Fallback ---
+
+def _load_fallback_points() -> list[dict]:
+    try:
+        with open(FALLBACK_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("points", [])
+    except Exception as e:
+        print(f"[carbon_service] fallback JSON okunamadı: {e}")
+        return []
+
+
+def _fallback_current() -> CarbonReading:
+    points = _load_fallback_points()
+    if not points:
+        return _generate_mock_current()
+    last = points[-1]
+    ts = datetime.fromisoformat(last["timestamp"])
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=TURKEY_TZ)
+    return CarbonReading(
+        timestamp=ts,
+        carbon_intensity=last["carbon_intensity"],
+        renewable_ratio=last["renewable_ratio"],
+        source="fallback",
+    )
+
+
+def _fallback_forecast(hours: int) -> ForecastResponse:
+    points = _load_fallback_points()
+    now = datetime.now(tz=TURKEY_TZ).replace(minute=0, second=0, microsecond=0)
+
+    # Saate göre ortalama karbon yoğunluğu — gerçek EPİAŞ verisinden
+    by_hour: dict[int, list[float]] = defaultdict(list)
+    by_hour_ratio: dict[int, list[float]] = defaultdict(list)
+    for p in points:
+        ts = datetime.fromisoformat(p["timestamp"])
+        by_hour[ts.hour].append(p["carbon_intensity"])
+        by_hour_ratio[ts.hour].append(p["renewable_ratio"])
+
+    forecast_points = []
+    for h in range(1, hours + 1):
+        ts = now + timedelta(hours=h)
+        hour = ts.hour
+        if by_hour.get(hour):
+            avg_ci = round(sum(by_hour[hour]) / len(by_hour[hour]), 1)
+            avg_rr = round(sum(by_hour_ratio[hour]) / len(by_hour_ratio[hour]), 3)
+        else:
+            avg_ci = 350.0
+            avg_rr = 0.50
+        forecast_points.append(ForecastPoint(
+            timestamp=ts,
+            carbon_intensity=avg_ci,
+            renewable_ratio=avg_rr,
+            confidence=_confidence(h),
+        ))
+
+    return ForecastResponse(
+        generated_at=now,
+        source="fallback",
+        points=forecast_points,
+    )
 
 
 # --- Mock generators ---
@@ -258,10 +327,16 @@ async def get_current_carbon() -> CarbonReading:
         return result
 
     try:
-        result = await asyncio.to_thread(_fetch_current_live)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_fetch_current_live),
+            timeout=API_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        print(f"[carbon_service] EPİAŞ {API_TIMEOUT}s timeout — JSON fallback")
+        result = _fallback_current()
     except Exception as e:
-        print(f"[carbon_service] get_current_carbon hatası, mock kullanılıyor: {e}")
-        result = _generate_mock_current()
+        print(f"[carbon_service] get_current_carbon hatası, fallback kullanılıyor: {e}")
+        result = _fallback_current()
 
     _cache_set("current", result, CURRENT_TTL)
     return result
@@ -278,10 +353,16 @@ async def get_forecast(hours: int = 24) -> ForecastResponse:
         return result
 
     try:
-        result = await asyncio.to_thread(_fetch_forecast_live, hours)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_fetch_forecast_live, hours),
+            timeout=API_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        print(f"[carbon_service] EPİAŞ forecast {API_TIMEOUT}s timeout — JSON fallback")
+        result = _fallback_forecast(hours)
     except Exception as e:
-        print(f"[carbon_service] get_forecast hatası, mock kullanılıyor: {e}")
-        result = generate_mock_forecast(hours)
+        print(f"[carbon_service] get_forecast hatası, fallback kullanılıyor: {e}")
+        result = _fallback_forecast(hours)
 
     _cache_set("forecast", result, FORECAST_TTL)
     return result

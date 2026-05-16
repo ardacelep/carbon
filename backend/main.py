@@ -1,0 +1,577 @@
+import os
+from datetime import datetime, timezone, timedelta
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+
+from models import (
+    UserCreate, UserLogin, TokenResponse,
+    JobCreate, JobResponse, JobListResponse, JobStatusUpdate,
+    JobTemplate, JobAnalyzeRequest, JobAnalyzeResponse,
+    ChatRequest, ChatResponse,
+    CurrentCarbonResponse, ForecastResponse, SavingsSummary,
+    GridStatus,
+    ScheduleResponse, ScheduledJobEntry, ScheduleSummary, ScheduleApproveRequest,
+)
+from carbon_service import get_current_carbon, get_forecast
+from grid_service import get_grid_status
+from scheduler import find_optimal_window, schedule_multiple_jobs
+from llm_service import get_chat_response, get_job_recommendation, stream_chat_response
+from database import get_supabase, create_job, get_jobs, get_job, update_job, _row_to_job_response
+
+load_dotenv()
+
+TURKEY_TZ = timezone(timedelta(hours=3))
+
+app = FastAPI(
+    title="Karbon Zeka API",
+    version="1.0.0",
+    swagger_ui_parameters={"persistAuthorization": True},
+)
+
+_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://undistractedly-gimlety-angelena.ngrok-free.app",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+# --- Startup ---
+
+@app.on_event("startup")
+async def startup():
+    import asyncio
+    asyncio.create_task(_auto_progress_jobs())
+
+
+async def _auto_progress_jobs():
+    import asyncio
+    while True:
+        await asyncio.sleep(15)
+        try:
+            supabase = await get_supabase()
+            now = datetime.now(tz=TURKEY_TZ)
+            now_iso = now.isoformat()
+
+            await supabase.table("jobs") \
+                .update({"status": "running"}) \
+                .eq("status", "scheduled") \
+                .not_.is_("scheduled_start", "null") \
+                .lte("scheduled_start", now_iso) \
+                .execute()
+
+            result = await supabase.table("jobs") \
+                .select("id,scheduled_start,duration_hours") \
+                .eq("status", "running") \
+                .execute()
+            for row in result.data:
+                start = datetime.fromisoformat(row["scheduled_start"])
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=TURKEY_TZ)
+                end = start + timedelta(hours=row["duration_hours"])
+                if now >= end:
+                    await supabase.table("jobs") \
+                        .update({"status": "completed"}) \
+                        .eq("id", row["id"]) \
+                        .execute()
+        except Exception as e:
+            print(f"[auto-progress] hata: {e}")
+
+
+# --- Auth Dependency ---
+
+async def get_current_user(authorization: str = Header(...)) -> str:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token gerekli")
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        supabase = await get_supabase()
+        user_response = await supabase.auth.get_user(token)
+        return str(user_response.user.id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Geçersiz veya süresi dolmuş token")
+
+
+# --- Auth ---
+
+@app.post("/api/auth/signup", response_model=TokenResponse, status_code=201)
+async def signup(body: UserCreate):
+    try:
+        supabase = await get_supabase()
+        response = await supabase.auth.sign_up({"email": body.email, "password": body.password})
+        if not response.user:
+            raise HTTPException(status_code=400, detail="Kayıt başarısız")
+        if not response.session:
+            raise HTTPException(status_code=400, detail="Email onayı gerekiyor — Supabase'de email onayını kapatın")
+        return TokenResponse(
+            access_token=response.session.access_token,
+            user_id=str(response.user.id),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[signup] hata: {e}")
+        raise HTTPException(status_code=400, detail="Kayıt başarısız")
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def login(body: UserLogin):
+    try:
+        supabase = await get_supabase()
+        response = await supabase.auth.sign_in_with_password({"email": body.email, "password": body.password})
+        if not response.session:
+            raise HTTPException(status_code=401, detail="Geçersiz email veya şifre")
+        return TokenResponse(
+            access_token=response.session.access_token,
+            user_id=str(response.user.id),
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Geçersiz email veya şifre")
+
+
+# --- Carbon ---
+
+@app.get("/api/carbon/current", response_model=CurrentCarbonResponse)
+async def current_carbon():
+    reading = await get_current_carbon()
+    now = datetime.now(tz=TURKEY_TZ)
+    ts = reading.timestamp
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=TURKEY_TZ)
+    minutes_ago = max(0, int((now - ts).total_seconds() / 60))
+    return CurrentCarbonResponse(
+        carbon_intensity=reading.carbon_intensity,
+        renewable_ratio=reading.renewable_ratio,
+        timestamp=reading.timestamp,
+        source=reading.source,
+        updated_minutes_ago=minutes_ago,
+    )
+
+
+@app.get("/api/carbon/forecast", response_model=ForecastResponse)
+async def carbon_forecast(hours: int = Query(default=24, ge=1, le=48)):
+    return await get_forecast(hours)
+
+
+# --- Grid ---
+
+@app.get("/api/grid/status", response_model=GridStatus)
+async def grid_status():
+    return await get_grid_status()
+
+
+# --- Jobs ---
+
+@app.post("/api/jobs", response_model=JobResponse, status_code=201)
+async def create_job_endpoint(body: JobCreate, user_id: str = Depends(get_current_user)):
+    current = await get_current_carbon()
+    forecast = await get_forecast(24)
+
+    optimal_window = None
+    try:
+        optimal_window = find_optimal_window(
+            forecast=forecast,
+            duration_hours=body.duration_hours,
+            deadline=body.deadline,
+            power_kw=body.power_kw,
+            current_intensity=current.carbon_intensity,
+            cost_weight=body.cost_weight,
+        )
+    except Exception as e:
+        print(f"[main] scheduler hatası: {e}")
+
+    grid_ctx = None
+    try:
+        grid = await get_grid_status()
+        grid_ctx = {
+            "dam_fullness_pct": grid.dam_fullness_pct,
+            "dam_trend": grid.dam_trend,
+            "ptf_tl_per_mwh": grid.ptf_tl_per_mwh,
+            "supply_demand_mw": grid.supply_demand_mw,
+            "grid_stress": grid.grid_stress,
+        }
+    except Exception:
+        pass
+
+    ai_rec = None
+    if optimal_window:
+        try:
+            ai_rec = await get_job_recommendation(
+                job_name=body.name,
+                duration_hours=body.duration_hours,
+                power_kw=body.power_kw,
+                optimal_window=optimal_window,
+                current_intensity=current.carbon_intensity,
+                grid_context=grid_ctx,
+            )
+        except Exception as e:
+            print(f"[main] LLM hatası: {e}")
+
+    row = await create_job(user_id, body, optimal_window, ai_rec)
+    return _row_to_job_response(row)
+
+
+@app.get("/api/jobs", response_model=JobListResponse)
+async def list_jobs(user_id: str = Depends(get_current_user)):
+    rows = await get_jobs(user_id)
+    jobs = [_row_to_job_response(r) for r in rows]
+    return JobListResponse(jobs=jobs, total=len(jobs))
+
+
+@app.get("/api/jobs/templates", response_model=list[JobTemplate])
+async def get_job_templates():
+    return [JobTemplate(**t) for t in JOB_TEMPLATES]
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobResponse)
+async def get_job_endpoint(job_id: int, user_id: str = Depends(get_current_user)):
+    row = await get_job(job_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="İş bulunamadı")
+    return _row_to_job_response(row)
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job_endpoint(job_id: int, user_id: str = Depends(get_current_user)):
+    row = await get_job(job_id, user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="İş bulunamadı")
+    supabase = await get_supabase()
+    await supabase.table("jobs").delete().eq("id", job_id).eq("user_id", user_id).execute()
+    return {"deleted": True}
+
+
+@app.post("/api/jobs/analyze", response_model=JobAnalyzeResponse)
+async def analyze_job(body: JobAnalyzeRequest, user_id: str = Depends(get_current_user)):
+    current = await get_current_carbon()
+    forecast = await get_forecast(24)
+
+    try:
+        window = find_optimal_window(
+            forecast=forecast,
+            duration_hours=body.duration_hours,
+            deadline=body.deadline,
+            power_kw=body.power_kw,
+            current_intensity=current.carbon_intensity,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=f"Tahmin verisi yetersiz: {e}")
+
+    grid_ctx = None
+    try:
+        grid = await get_grid_status()
+        grid_ctx = {
+            "dam_fullness_pct": grid.dam_fullness_pct,
+            "dam_trend": grid.dam_trend,
+            "ptf_tl_per_mwh": grid.ptf_tl_per_mwh,
+            "supply_demand_mw": grid.supply_demand_mw,
+            "grid_stress": grid.grid_stress,
+        }
+    except Exception:
+        pass
+
+    rec = await get_job_recommendation(
+        job_name=body.name,
+        duration_hours=body.duration_hours,
+        power_kw=body.power_kw,
+        optimal_window=window,
+        current_intensity=current.carbon_intensity,
+        grid_context=grid_ctx,
+    )
+
+    if rec:
+        reply = (
+            f"**{body.name} İş Analizi**\n\n"
+            f"📅 Önerilen Pencere: {rec.date} {rec.window}\n"
+            f"💚 CO₂ Tasarrufu: {rec.savings_kg:.2f} kg (%%{rec.savings_pct:.0f})\n"
+            f"⚡ Mevcut Yoğunluk: {current.carbon_intensity:.0f} gCO₂/kWh\n\n"
+            f"**Değerlendirme:** {rec.reasoning}\n\n"
+            f"**Öneri:** {rec.action}"
+        )
+    else:
+        reply = (
+            f"**{body.name}** için optimal pencere: "
+            f"{window.start_time.strftime('%d.%m %H:%M')}–{window.end_time.strftime('%H:%M')}. "
+            f"Tahmini tasarruf: %{window.estimated_savings_pct:.0f}. {window.reasoning}"
+        )
+
+    return JobAnalyzeResponse(
+        reply=reply,
+        optimal_window=window,
+        recommendation=rec,
+        current_carbon_intensity=current.carbon_intensity,
+    )
+
+
+@app.patch("/api/jobs/{job_id}/status", response_model=JobResponse)
+async def update_job_status(job_id: int, body: JobStatusUpdate, user_id: str = Depends(get_current_user)):
+    row = await update_job(job_id, user_id, {"status": body.status})
+    if not row:
+        raise HTTPException(status_code=404, detail="İş bulunamadı")
+    return _row_to_job_response(row)
+
+
+# --- Schedule ---
+
+def _carbon_color(ci: float) -> str:
+    if ci < 200: return "#22c55e"
+    if ci < 250: return "#eab308"
+    if ci < 350: return "#f97316"
+    return "#ef4444"
+
+
+def _build_schedule_response(rows: list[dict], windows: dict[int, object]) -> ScheduleResponse:
+    entries = []
+    total_saved = 0.0
+    total_kwh = 0.0
+    savings_list = []
+
+    for row in rows:
+        job_id = row["id"]
+        window = windows.get(job_id)
+        if not window:
+            continue
+
+        kwh = row["power_kw"] * row["duration_hours"]
+        pct = window.estimated_savings_pct
+        ci = window.avg_carbon_intensity
+        if pct > 0 and pct < 100:
+            baseline_ci = ci / (1 - pct / 100)
+            total_saved += kwh * baseline_ci * (pct / 100) / 1000
+        total_kwh += kwh
+        savings_list.append(pct)
+
+        entries.append(ScheduledJobEntry(
+            job_id=job_id,
+            name=row["name"],
+            start_time=window.start_time,
+            end_time=window.end_time,
+            duration_hours=row["duration_hours"],
+            power_kw=row["power_kw"],
+            avg_carbon_intensity=window.avg_carbon_intensity,
+            estimated_savings_pct=window.estimated_savings_pct,
+            status=row["status"],
+            color=_carbon_color(window.avg_carbon_intensity),
+            reasoning=window.reasoning,
+            ai_recommendation=row.get("ai_recommendation"),
+        ))
+
+    entries.sort(key=lambda e: e.start_time)
+
+    summary = ScheduleSummary(
+        total_jobs=len(rows),
+        scheduled_jobs=len(entries),
+        total_carbon_saved_kg=round(total_saved, 3),
+        total_energy_kwh=round(total_kwh, 2),
+        avg_savings_pct=round(sum(savings_list) / len(savings_list), 1) if savings_list else 0.0,
+    )
+    return ScheduleResponse(
+        generated_at=datetime.now(tz=TURKEY_TZ),
+        jobs=entries,
+        summary=summary,
+    )
+
+
+@app.get("/api/schedule", response_model=ScheduleResponse)
+async def get_schedule(user_id: str = Depends(get_current_user)):
+    rows = await get_jobs(user_id)
+    active = [r for r in rows if r["status"] in ("pending", "scheduled")]
+    if not active:
+        return ScheduleResponse(
+            generated_at=datetime.now(tz=TURKEY_TZ),
+            jobs=[],
+            summary=ScheduleSummary(total_jobs=0, scheduled_jobs=0,
+                                    total_carbon_saved_kg=0.0, total_energy_kwh=0.0, avg_savings_pct=0.0),
+        )
+
+    current = await get_current_carbon()
+    forecast = await get_forecast(24)
+    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity)
+    return _build_schedule_response(active, windows)
+
+
+@app.post("/api/schedule/approve", response_model=ScheduleResponse)
+async def approve_schedule(body: ScheduleApproveRequest, user_id: str = Depends(get_current_user)):
+    rows = await get_jobs(user_id)
+    active = [r for r in rows if r["status"] in ("pending", "scheduled")]
+
+    if body.job_ids:
+        active = [r for r in active if r["id"] in body.job_ids]
+
+    if not active:
+        raise HTTPException(status_code=404, detail="Onaylanacak iş bulunamadı")
+
+    current = await get_current_carbon()
+    forecast = await get_forecast(24)
+    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity)
+
+    now = datetime.now(tz=TURKEY_TZ)
+    for i, row in enumerate(active):
+        window = windows.get(row["id"])
+        if not window:
+            continue
+        if body.demo_mode:
+            # Demo: ilk iş 15s, sonrakiler sırayla 90s arayla
+            start = now + timedelta(seconds=15 + i * 90)
+        else:
+            start = window.start_time
+        await update_job(row["id"], user_id, {"scheduled_start": start.isoformat(), "status": "scheduled"})
+
+    updated_rows = await get_jobs(user_id)
+    active_updated = [r for r in updated_rows if r["id"] in {r["id"] for r in active}]
+    return _build_schedule_response(active_updated, windows)
+
+
+JOB_TEMPLATES = [
+    {"name": "Log Processing",          "duration_hours": 2,  "power_kw": 50,  "priority": 1, "description": "Sistem log dosyalarının işlenmesi ve arşivlenmesi"},
+    {"name": "Backup İşlemi",           "duration_hours": 3,  "power_kw": 80,  "priority": 2, "description": "Kritik verilerin yedeklenmesi"},
+    {"name": "ML Model Eğitimi",        "duration_hours": 8,  "power_kw": 300, "priority": 3, "description": "Makine öğrenmesi modelinin sıfırdan eğitimi"},
+    {"name": "Model Fine-tuning",       "duration_hours": 12, "power_kw": 250, "priority": 3, "description": "Mevcut modelin ince ayarı"},
+    {"name": "Veri Senkronizasyonu",    "duration_hours": 1,  "power_kw": 30,  "priority": 2, "description": "Veritabanları arası veri senkronizasyonu"},
+    {"name": "Batch Data Processing",   "duration_hours": 6,  "power_kw": 150, "priority": 2, "description": "Toplu veri işleme ve dönüşüm"},
+    {"name": "Database Optimizasyonu",  "duration_hours": 4,  "power_kw": 100, "priority": 1, "description": "Veritabanı indeks ve sorgu optimizasyonu"},
+]
+
+DEMO_JOB_TEMPLATES = [
+    {"name": "Veri Yedekleme", "duration_hours": 1, "power_kw": 50, "priority": 2},
+    {"name": "Model Eğitimi",  "duration_hours": 2, "power_kw": 250, "priority": 3},
+    {"name": "Log Analizi",    "duration_hours": 1, "power_kw": 30, "priority": 1},
+]
+
+
+@app.post("/api/schedule/demo", response_model=ScheduleResponse)
+async def demo_schedule(user_id: str = Depends(get_current_user)):
+    current = await get_current_carbon()
+    forecast = await get_forecast(24)
+
+    created_rows = []
+    for tmpl in DEMO_JOB_TEMPLATES:
+        from models import JobCreate
+        job_body = JobCreate(**tmpl)
+        window = None
+        try:
+            window = find_optimal_window(
+                forecast=forecast,
+                duration_hours=job_body.duration_hours,
+                deadline=None,
+                power_kw=job_body.power_kw,
+                current_intensity=current.carbon_intensity,
+            )
+        except Exception:
+            pass
+        row = await create_job(user_id, job_body, window, None)
+        created_rows.append(row)
+
+    active = [r for r in created_rows if r["status"] in ("pending", "scheduled")]
+    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity)
+
+    now = datetime.now(tz=TURKEY_TZ)
+    for i, row in enumerate(active):
+        window = windows.get(row["id"])
+        if not window:
+            continue
+        start = now + timedelta(seconds=15 + i * 90)
+        await update_job(row["id"], user_id, {"scheduled_start": start.isoformat(), "status": "scheduled"})
+
+    updated = await get_jobs(user_id)
+    created_ids = {r["id"] for r in created_rows}
+    active_updated = [r for r in updated if r["id"] in created_ids]
+    return _build_schedule_response(active_updated, windows)
+
+
+# --- Chat ---
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
+    history_dicts = [{"role": m.role, "content": m.content} for m in body.history]
+    reply = await get_chat_response(body.message, history_dicts, {})
+    return ChatResponse(reply=reply, timestamp=datetime.now(tz=TURKEY_TZ))
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(body: ChatRequest, user_id: str = Depends(get_current_user)):
+    history_dicts = [{"role": m.role, "content": m.content} for m in body.history]
+
+    return StreamingResponse(
+        stream_chat_response(body.message, history_dicts, {}),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# --- Savings ---
+
+@app.get("/api/savings/summary", response_model=SavingsSummary)
+async def savings_summary(user_id: str = Depends(get_current_user)):
+    rows = await get_jobs(user_id)
+
+    if not rows:
+        return SavingsSummary(
+            total_jobs=0, optimized_jobs=0, total_carbon_saved_kg=0.0,
+            total_energy_kwh=0.0, avg_carbon_intensity=0.0,
+            best_saving_pct=0.0, period_start=None, period_end=None,
+        )
+
+    optimized = [r for r in rows if r.get("optimal_start_time")]
+
+    total_carbon_saved_kg = 0.0
+    for r in optimized:
+        kwh = r["power_kw"] * r["duration_hours"]
+        pct = (r["estimated_savings_pct"] or 0.0) / 100
+        ci = r["avg_carbon_intensity"] or 0.0
+        if pct < 1.0:
+            baseline_ci = ci / (1 - pct)
+            total_carbon_saved_kg += kwh * baseline_ci * pct / 1000
+
+    total_energy_kwh = sum(r["power_kw"] * r["duration_hours"] for r in rows)
+    avg_carbon = (
+        sum(r["avg_carbon_intensity"] or 0 for r in optimized) / len(optimized)
+        if optimized else 0.0
+    )
+    best_saving_pct = max((r["estimated_savings_pct"] or 0.0 for r in optimized), default=0.0)
+
+    created_dates = [datetime.fromisoformat(r["created_at"]) for r in rows]
+
+    return SavingsSummary(
+        total_jobs=len(rows),
+        optimized_jobs=len(optimized),
+        total_carbon_saved_kg=round(total_carbon_saved_kg, 3),
+        total_energy_kwh=round(total_energy_kwh, 2),
+        avg_carbon_intensity=round(avg_carbon, 1),
+        best_saving_pct=round(best_saving_pct, 1),
+        period_start=min(created_dates),
+        period_end=max(created_dates),
+    )
+
+
+# --- Swagger Bearer Auth ---
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title="Karbon Zeka API", version="1.0.0", routes=app.routes)
+    schema.setdefault("components", {})["securitySchemes"] = {
+        "BearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
+    }
+    for path in schema["paths"].values():
+        for operation in path.values():
+            operation["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi
