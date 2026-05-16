@@ -13,11 +13,16 @@
 3. [24 Saatlik Tahmin](#3-24-saatlik-tahmin)
 4. [Şebeke Durumu](#4-şebeke-durumu)
 5. [İş Kuyruğu (Jobs)](#5-i̇ş-kuyruğu)
-6. [Sohbet (Chat)](#6-sohbet)
-7. [Streaming Sohbet (SSE)](#7-streaming-sohbet)
-8. [Tasarruf Özeti](#8-tasarruf-özeti)
-9. [Hata Kodları](#9-hata-kodları)
-10. [Hızlı Başlangıç](#10-hızlı-başlangıç)
+   - 5.1 İş Oluştur / Listele / Getir / Sil / Güncelle
+   - [5.2 İş Şablonları](#52-i̇ş-şablonları--get-apijobstemplates)
+   - [5.3 Analiz (kayıtsız)](#53-analiz-kayıtsız--post-apijobsanalyze)
+6. [Zamanlama (Schedule)](#6-zamanlama-schedule)
+7. [Sohbet (Chat)](#7-sohbet)
+8. [Streaming Sohbet (SSE)](#8-streaming-sohbet)
+9. [Tasarruf Özeti](#9-tasarruf-özeti)
+10. [Arka Plan İş İlerlemesi](#10-arka-plan-i̇ş-i̇lerlemesi)
+11. [Hata Kodları](#11-hata-kodları)
+12. [Hızlı Başlangıç](#12-hızlı-başlangıç)
 
 ---
 
@@ -154,7 +159,7 @@ function getCarbonColor(ci) {
 |---|---|---|
 | `source` | `"epias"` \| `"epias-partial"` \| `"fallback"` \| `"mock"` | `"epias-partial"` = rüzgar tahmini alınamadı |
 | `points[].confidence` | `float` | 0.55–0.90. Yakın saat = yüksek güven. Grafik şeffaflığı için kullan |
-| `points[].ptf_tl_per_mwh` | `float \| null` | Elektrik spot fiyatı (ileriki versiyonda dolu gelecek) |
+| `points[].ptf_tl_per_mwh` | `float` | Saatlik elektrik spot fiyatı ₺/MWh. EPİAŞ verisi varsa gerçek, yoksa saatlik mock pattern (850–1950 ₺/MWh) |
 
 **Cache:** 30 dakika. Her 15 dakikada bir polling önerilir.
 
@@ -246,6 +251,7 @@ Tüm job endpoint'leri **auth gerektirir.**
     "end_time": "2026-05-16T15:00:00+03:00",
     "avg_carbon_intensity": 202.3,
     "estimated_savings_pct": 18.5,
+    "estimated_savings_tl": 124.5,
     "reasoning": "16.05 tarihinde 11:00–15:00 arası en uygun pencere. Ortalama karbon yoğunluğu 202.3 gCO2eq/kWh — şu anki değerden %18 daha düşük. Güneş üretiminin yüksek olduğu öğle saatlerinden yararlanıyor."
   },
   "ai_recommendation": "Model Eğitimi v2 için en uygun çalışma penceresi 11:00–15:00 arasıdır; güneş üretiminin pik yaptığı bu saatlerde karbon yoğunluğu %18 daha düşük seyrediyor. Bu optimizasyonla 45.5 kg CO2 tasarruf etmiş olacaksınız. İşinizi hemen bu pencereye alın!"
@@ -256,6 +262,7 @@ Tüm job endpoint'leri **auth gerektirir.**
 |---|---|---|
 | `status` | `string` | `"scheduled"` = optimal pencere bulundu, `"pending"` = bulunamadı |
 | `optimal_window` | `object \| null` | `null` ise zamanlamada uygun pencere yok |
+| `optimal_window.estimated_savings_tl` | `float \| null` | Optimal pencerede mevcut PTF'e göre tahmini TL elektrik tasarrufu |
 | `ai_recommendation` | `string \| null` | Llama 3.3 70B tarafından üretilen Türkçe öneri |
 
 ---
@@ -281,6 +288,97 @@ Tüm job endpoint'leri **auth gerektirir.**
 
 **Yanıt `200`:** Job response (yukarıdakiyle aynı şema)  
 **Yanıt `404`:** `{"detail": "İş bulunamadı"}`
+
+---
+
+### 5.2 İş Şablonları — `GET /api/jobs/templates`
+
+**Auth gerekmez.**  
+Frontend'deki "hızlı ekle" butonları için 7 hazır şablon.
+
+**Yanıt `200`:**
+```json
+[
+  {
+    "name": "Log Processing",
+    "duration_hours": 2,
+    "power_kw": 50,
+    "priority": 1,
+    "description": "Sistem log dosyalarının işlenmesi ve arşivlenmesi"
+  },
+  {
+    "name": "ML Model Eğitimi",
+    "duration_hours": 8,
+    "power_kw": 300,
+    "priority": 3,
+    "description": "Makine öğrenmesi modelinin sıfırdan eğitimi"
+  }
+]
+```
+
+**Kullanım:** Kullanıcı şablona tıkladığında bu değerler `POST /api/jobs/analyze`'e gönderilir, yanıttaki `reply` chatbota eklenir.
+
+---
+
+### 5.3 Analiz (kayıtsız) — `POST /api/jobs/analyze`
+
+**Auth gerekir.** DB'ye kayıt yapmaz. Şablon tıklandığında çağrılır.
+
+**İstek:**
+```json
+{
+  "name": "ML Model Eğitimi",
+  "duration_hours": 8,
+  "power_kw": 300,
+  "priority": 3
+}
+```
+
+| Alan | Tip | Zorunlu |
+|---|---|---|
+| `name` | `string` | ✅ |
+| `duration_hours` | `float` | ✅ |
+| `power_kw` | `float` | ✅ |
+| `priority` | `int` | — (varsayılan 1) |
+| `deadline` | ISO-8601 | — |
+
+**Yanıt `200`:**
+```json
+{
+  "reply": "**ML Model Eğitimi İş Analizi**\n\n📅 Önerilen Pencere: 16.05 11:00–19:00\n💚 CO₂ Tasarrufu: 38.40 kg (%18)\n⚡ Mevcut Yoğunluk: 247 gCO₂/kWh\n\n**Değerlendirme:** Güneş üretiminin yüksek olduğu öğle saatleri...",
+  "optimal_window": {
+    "start_time": "2026-05-16T11:00:00+03:00",
+    "end_time": "2026-05-16T19:00:00+03:00",
+    "avg_carbon_intensity": 203.5,
+    "estimated_savings_pct": 17.7,
+    "estimated_savings_tl": 312.0,
+    "reasoning": "..."
+  },
+  "recommendation": {
+    "window": "11:00–19:00",
+    "date": "16.05",
+    "savings_kg": 38.4,
+    "savings_pct": 17.7,
+    "reasoning": "...",
+    "action": "İşi hemen 11:00'e planlayın"
+  },
+  "current_carbon_intensity": 247.1
+}
+```
+
+**React entegrasyonu:**
+```js
+async function analyzeTemplate(template) {
+  const res = await fetch('/api/jobs/analyze', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(template),
+  })
+  const data = await res.json()
+  // reply'ı chatbota ekle:
+  addMessage({ role: 'assistant', content: data.reply })
+}
+```
 
 ---
 
@@ -310,11 +408,137 @@ Geçerli değerler: `"pending"` `"scheduled"` `"running"` `"completed"` `"cancel
 
 ---
 
-## 6. Sohbet
+## 6. Zamanlama (Schedule)
+
+Tüm zamanlama endpoint'leri **auth gerektirir.**
+
+Zamanlayıcı, kullanıcının tüm `pending` ve `scheduled` işleri için karbon yoğunluğu tahmini üzerinde çakışmasız pencere ataması yapar. Planlı kesintiler (EPİAŞ'tan çekilen `planned_outages`) otomatik olarak dikkate alınır.
+
+---
+
+### `GET /api/schedule` — Mevcut takvimi görüntüle
+
+İşleri henüz onaylamadan takvimi hesaplar — **DB'ye yazmaz.**
+
+**Yanıt `200`:**
+```json
+{
+  "generated_at": "2026-05-16T09:00:00+03:00",
+  "jobs": [
+    {
+      "job_id": 1,
+      "name": "Model Eğitimi v2",
+      "start_time": "2026-05-16T11:00:00+03:00",
+      "end_time": "2026-05-16T15:00:00+03:00",
+      "duration_hours": 4,
+      "power_kw": 250,
+      "avg_carbon_intensity": 202.3,
+      "estimated_savings_pct": 18.5,
+      "estimated_savings_tl": 124.5,
+      "status": "scheduled",
+      "color": "#22c55e",
+      "reasoning": "16.05 tarihinde 11:00–15:00 arası en uygun pencere.",
+      "ai_recommendation": "..."
+    },
+    {
+      "job_id": 2,
+      "name": "Log Processing",
+      "start_time": "2026-05-16T15:00:00+03:00",
+      "end_time": "2026-05-16T17:00:00+03:00",
+      "duration_hours": 2,
+      "power_kw": 50,
+      "avg_carbon_intensity": 218.0,
+      "estimated_savings_pct": 11.2,
+      "estimated_savings_tl": 18.3,
+      "status": "scheduled",
+      "color": "#eab308",
+      "reasoning": "...",
+      "ai_recommendation": null
+    }
+  ],
+  "summary": {
+    "total_jobs": 2,
+    "scheduled_jobs": 2,
+    "total_carbon_saved_kg": 47.6,
+    "total_energy_kwh": 1100.0,
+    "avg_savings_pct": 14.9,
+    "total_cost_saved_tl": 142.8
+  }
+}
+```
+
+| Alan | Tip | Açıklama |
+|---|---|---|
+| `jobs[].color` | hex string | Karbon yoğunluğuna göre: `#22c55e` (<200), `#eab308` (<250), `#f97316` (<350), `#ef4444` (≥350) |
+| `jobs[].estimated_savings_tl` | `float \| null` | PTF fiyat farkına dayalı tahmini TL elektrik tasarrufu |
+| `summary.total_cost_saved_tl` | `float \| null` | Tüm işlerin TL tasarruf toplamı |
+
+**Çakışma garantisi:** Her iki iş aynı saat dilimine atanmaz. İş önceliği (`priority` DESC) ve deadline'a göre sıralanır.
+
+---
+
+### `POST /api/schedule/approve` — Takvimi onayla
+
+Hesaplanan takvimi DB'ye yazar; `scheduled_start` alanlarını doldurur.
+
+**İstek:**
+```json
+{
+  "job_ids": [],
+  "demo_mode": false
+}
+```
+
+| Alan | Tip | Açıklama |
+|---|---|---|
+| `job_ids` | `int[]` | Onaylanacak iş ID'leri. **Boş dizi = tüm aktif işler onaylanır** |
+| `demo_mode` | `bool` | `true` → `scheduled_start` değerleri şimdiki zamana çekilir (demo/sunum için) |
+
+**Yanıt `200`:** `ScheduleResponse` — onaylanmış işleri içerir (`GET /api/schedule` şemasıyla aynı)
+
+**Tipik akış:**
+```js
+// 1. Önizle
+const preview = await fetch('/api/schedule', { headers: authHeaders() }).then(r => r.json())
+// 2. Kullanıcı onaylarsa kaydet
+const approved = await fetch('/api/schedule/approve', {
+  method: 'POST',
+  headers: authHeaders(),
+  body: JSON.stringify({ job_ids: [], demo_mode: false }),
+}).then(r => r.json())
+```
+
+---
+
+### `POST /api/schedule/demo` — Demo preset çalıştır
+
+3 hazır demo işi oluşturur (Veri Yedekleme, Model Eğitimi, Log Analizi) ve hemen onaylar. Sunum ve demo amacıyla kullanılır.
+
+**İstek body gerekmez.**
+
+**Yanıt `200`:** `ScheduleResponse` — 3 iş, çakışmasız zaman dilimleriyle
+
+```json
+{
+  "generated_at": "...",
+  "jobs": [
+    { "name": "Veri Yedekleme", "duration_hours": 2, ... },
+    { "name": "Model Eğitimi", "duration_hours": 4, ... },
+    { "name": "Log Analizi",   "duration_hours": 1, ... }
+  ],
+  "summary": { "total_jobs": 3, "scheduled_jobs": 3, ... }
+}
+```
+
+**Not:** Demo modunda `scheduled_start` değerleri sırasıyla 30 sn, 2 dk, 4 dk sonrası olarak atanır — arkaplanda ilerleme animasyonu otomatik başlar.
+
+---
+
+## 7. Sohbet
 
 ### `POST /api/chat` — AI chat (tam yanıt)
 
-**Auth gerekmez.**
+**Auth gerekir.**
 
 AI her yanıtta anlık karbon yoğunluğunu, şebeke durumunu (baraj, PTF, stres) ve bağlamı otomatik alır — kullanıcının bunu söylemesine gerek yok.
 
@@ -344,11 +568,11 @@ AI her yanıtta anlık karbon yoğunluğunu, şebeke durumunu (baraj, PTF, stres
 
 ---
 
-## 7. Streaming Sohbet
+## 8. Streaming Sohbet
 
 ### `POST /api/chat/stream` — SSE token stream
 
-**Auth gerekmez.**  
+**Auth gerekir.**  
 İstek body `POST /api/chat` ile aynıdır.
 
 **Yanıt:** `Content-Type: text/event-stream`
@@ -378,7 +602,7 @@ data: [DONE]
 async function streamChat(message, history, onToken) {
   const res = await fetch('http://localhost:8000/api/chat/stream', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify({ message, history }),
   })
 
@@ -413,7 +637,7 @@ await streamChat(
 
 ---
 
-## 8. Tasarruf Özeti
+## 9. Tasarruf Özeti
 
 ### `GET /api/savings/summary` — Kullanıcının toplam tasarrufu
 
@@ -450,7 +674,37 @@ const avgSavingPerJob  = (total_carbon_saved_kg / optimized_jobs).toFixed(1)
 
 ---
 
-## 9. Hata Kodları
+## 10. Arka Plan İş İlerlemesi
+
+Sunucu başladığında her **15 saniyede** bir arka planda çalışan bir görev iş durumlarını otomatik günceller:
+
+| Koşul | Geçiş |
+|---|---|
+| `status = "scheduled"` ve `scheduled_start ≤ şimdi` | → `"running"` |
+| `status = "running"` ve `scheduled_start + duration_hours ≤ şimdi` | → `"completed"` |
+
+**Frontend polling önerisi:**
+```js
+// Her 10 saniyede iş listesini çek — status güncellemelerini yakala
+useEffect(() => {
+  const interval = setInterval(async () => {
+    const data = await getJobs()
+    setJobs(data.jobs)
+  }, 10_000)
+  return () => clearInterval(interval)
+}, [])
+```
+
+**Demo akışı:**
+1. `POST /api/schedule/demo` → 3 iş oluşturulur, `scheduled_start` sırasıyla 30 sn / 2 dk / 4 dk sonrası
+2. 30 sn sonra ilk iş `"running"` olur
+3. Birkaç dakika içinde tüm işler `"completed"` olur
+
+**Not:** Arka plan görevi yalnızca `scheduled_start` alanı dolu olan işleri günceller. `POST /api/schedule/approve` çağrısına kadar bu alan boştur.
+
+---
+
+## 11. Hata Kodları
 
 | HTTP Kodu | Durum | Açıklama |
 |---|---|---|
@@ -480,7 +734,7 @@ const avgSavingPerJob  = (total_carbon_saved_kg / optimized_jobs).toFixed(1)
 
 ---
 
-## 10. Hızlı Başlangıç
+## 12. Hızlı Başlangıç
 
 Uçtan uca minimum akış — kayıt, token alma, iş ekleme:
 
