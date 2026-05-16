@@ -1,4 +1,5 @@
 import os
+import httpx
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -102,9 +103,18 @@ async def get_current_user(authorization: str = Header(...)) -> UserContext:
         raise HTTPException(status_code=401, detail="Bearer token gerekli")
     token = authorization.removeprefix("Bearer ").strip()
     try:
-        supabase = await get_supabase()
-        user_response = await supabase.auth.get_user(token)
-        return UserContext(user_id=str(user_response.user.id), token=token)
+        supabase_url = os.getenv("SUPABASE_URL", "")
+        supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            r = await http.get(
+                f"{supabase_url}/auth/v1/user",
+                headers={"Authorization": f"Bearer {token}", "apikey": supabase_key},
+            )
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Geçersiz veya süresi dolmuş token")
+        return UserContext(user_id=str(r.json()["id"]), token=token)
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=401, detail="Geçersiz veya süresi dolmuş token")
 

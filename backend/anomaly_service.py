@@ -81,19 +81,31 @@ def _get_baseline() -> dict[int, dict]:
 
 # --- Anomali tespiti ---
 
+MIN_SAMPLES = 7  # güvenilir baseline için minimum gözlem
+
+
 def detect_anomaly(carbon_intensity: float, hour: int) -> dict:
     baseline = _get_baseline()
     stats = baseline.get(hour)
 
-    if stats is None or stats["std"] == 0.0:
-        direction_msg = ""
-        if stats is not None:
-            direction_msg = (
+    insufficient = (
+        stats is None
+        or stats["std"] == 0.0
+        or stats["count"] < MIN_SAMPLES
+    )
+    if insufficient:
+        if stats is None:
+            msg = f"Saat {hour:02d}:00 için geçmiş veri yok."
+        elif stats["count"] < MIN_SAMPLES:
+            msg = (
+                f"Saat {hour:02d}:00 için yalnızca {stats['count']} gözlem var "
+                f"(minimum {MIN_SAMPLES} gerekli) — baseline henüz güvenilir değil."
+            )
+        else:
+            msg = (
                 f"Saat {hour:02d}:00 için tüm geçmiş değerler aynı "
                 f"({stats['mean']:.1f} gCO2/kWh) — Z-skoru hesaplanamıyor."
             )
-        else:
-            direction_msg = f"Saat {hour:02d}:00 için geçmiş veri yok."
         return {
             "z_score": 0.0,
             "severity": "unknown",
@@ -101,7 +113,7 @@ def detect_anomaly(carbon_intensity: float, hour: int) -> dict:
             "hour_mean": stats["mean"] if stats else None,
             "hour_std": stats["std"] if stats else None,
             "sample_count": stats["count"] if stats else 0,
-            "message": direction_msg,
+            "message": msg,
             "recommendation": "Yeterli geçmiş veri olmadığı için anomali tespiti yapılamıyor.",
         }
 
