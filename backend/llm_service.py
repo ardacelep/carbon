@@ -154,7 +154,10 @@ _SYSTEM_PROMPT = (
     "Yanıtlarında:\n"
     "- Somut sayılar ver (gCO2/kWh, kg tasarruf, saat)\n"
     "- Maksimum 3 kısa paragraf yaz\n"
-    "- Her zaman Türkçe yanıt ver"
+    "- Her zaman Türkçe yanıt ver\n\n"
+    "KRİTİK KURAL: Araç sonuçlarından ve sana verilen verilerden gelen sayısal değerleri "
+    "(gCO₂/kWh, kg CO₂, %, saat) TAM OLARAK kullan. Yuvarlama, tahmin veya değiştirme yapma. "
+    "Bilmediğin bir değer varsa araç çağır, uydurma."
 )
 
 
@@ -214,7 +217,22 @@ async def stream_chat_response(
     carbon_context: dict,
     grid_context: dict | None = None,
 ) -> AsyncGenerator[str, None]:
-    messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+    # Halüsinasyon önlemi: gerçek EPİAŞ verisini sistem promptuna ekle
+    live_context = ""
+    try:
+        from carbon_service import get_current_carbon
+        current = await get_current_carbon()
+        live_context = (
+            f"\n\nAnlık EPİAŞ verisi ({current.timestamp.strftime('%d.%m.%Y %H:%M')} itibarıyla):\n"
+            f"- Karbon yoğunluğu: {current.carbon_intensity:.1f} gCO₂/kWh\n"
+            f"- Yenilenebilir oran: %{current.renewable_ratio * 100:.1f}\n"
+            f"- Kaynak: {current.source}\n"
+            "Bu değerleri yanıtında olduğu gibi kullan."
+        )
+    except Exception:
+        pass
+
+    messages = [{"role": "system", "content": _SYSTEM_PROMPT + live_context}]
     messages += history[-6:]
     messages.append({"role": "user", "content": message})
 
@@ -284,7 +302,22 @@ async def get_job_recommendation(
             end = text.rfind("}") + 1
             if start != -1 and end > start:
                 text = text[start:end]
-            return JobRecommendation.model_validate_json(text)
+            rec = JobRecommendation.model_validate_json(text)
+            # Sayı tutarlılığı: LLM'in ürettiği savings değerleri
+            # hesaplananlardan ±5 puan veya ±%10 kg sapıyorsa override et
+            pct_drift = abs(rec.savings_pct - optimal_window.estimated_savings_pct)
+            kg_drift = abs(rec.savings_kg - saving_kg)
+            if pct_drift > 5.0 or kg_drift > max(0.5, abs(saving_kg) * 0.10):
+                print(
+                    f"[llm_service] sayı sapması düzeltildi — "
+                    f"savings_pct: {rec.savings_pct:.1f}→{optimal_window.estimated_savings_pct:.1f}, "
+                    f"savings_kg: {rec.savings_kg:.2f}→{saving_kg:.2f}"
+                )
+                rec = rec.model_copy(update={
+                    "savings_pct": round(optimal_window.estimated_savings_pct, 1),
+                    "savings_kg": round(saving_kg, 2),
+                })
+            return rec
         except (ValidationError, Exception) as e:
             print(f"[llm_service] öneri parse hatası (temp={temp}): {e}")
 
