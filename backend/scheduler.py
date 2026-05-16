@@ -14,6 +14,7 @@ def find_optimal_window(
     power_kw: float,
     current_intensity: float,
     cost_weight: float = 0.0,
+    current_ptf: float | None = None,
 ) -> OptimalWindow:
     points = forecast.points
     if not points:
@@ -73,6 +74,13 @@ def find_optimal_window(
 
     savings_pct = round(max(0.0, (current_intensity - avg_carbon) / current_intensity * 100), 1)
 
+    savings_tl = None
+    if current_ptf is not None:
+        ptf_vals = [p.ptf_tl_per_mwh for p in best_window if p.ptf_tl_per_mwh is not None]
+        if ptf_vals:
+            avg_ptf = sum(ptf_vals) / len(ptf_vals)
+            savings_tl = round(max(0.0, power_kw * duration_hours * (current_ptf - avg_ptf) / 1000), 2)
+
     # Türkçe reasoning
     start_str = start_time.strftime("%H:%M")
     end_str = end_time.strftime("%H:%M")
@@ -103,6 +111,7 @@ def find_optimal_window(
         avg_carbon_intensity=avg_carbon,
         estimated_savings_pct=savings_pct,
         reasoning=reasoning,
+        estimated_savings_tl=savings_tl,
     )
 
 
@@ -110,20 +119,24 @@ def schedule_multiple_jobs(
     jobs: list[dict],
     forecast: ForecastResponse,
     current_intensity: float,
+    outage_slots: set | None = None,
+    current_ptf: float | None = None,
 ) -> dict[int, OptimalWindow]:
     try:
-        result = _schedule_ortools(jobs, forecast, current_intensity)
+        result = _schedule_ortools(jobs, forecast, current_intensity, outage_slots, current_ptf)
         print(f"[scheduler] OR-Tools: {len(result)}/{len(jobs)} iş planlandı")
         return result
     except Exception as e:
         print(f"[scheduler] OR-Tools başarısız ({e}), greedy fallback devreye giriyor")
-        return _schedule_greedy(jobs, forecast, current_intensity)
+        return _schedule_greedy(jobs, forecast, current_intensity, outage_slots, current_ptf)
 
 
 def _schedule_ortools(
     jobs: list[dict],
     forecast: ForecastResponse,
     current_intensity: float,
+    outage_slots: set | None = None,
+    current_ptf: float | None = None,
 ) -> dict[int, OptimalWindow]:
     from ortools.sat.python import cp_model
 
@@ -160,9 +173,13 @@ def _schedule_ortools(
 
         # Her başlangıç slotu için karbon maliyeti (tamsayı, 10x ölçekli)
         SCALE = 10
+        FORBIDDEN = int(999999 * SCALE)
         costs = []
         for s in range(max_start + 1):
             window_pts = points[s: s + duration]
+            if outage_slots and any(p.timestamp in outage_slots for p in window_pts):
+                costs.append(FORBIDDEN)
+                continue
             avg_ci = sum(p.carbon_intensity for p in window_pts) / len(window_pts) if window_pts else current_intensity
             costs.append(int(avg_ci * SCALE))
 
@@ -229,6 +246,13 @@ def _schedule_ortools(
         elif all(h < 6 or h >= 22 for h in hours_in):
             note = " Düşük talebin olduğu gece saatlerinde yenilenebilir oran artıyor."
 
+        savings_tl = None
+        if current_ptf is not None:
+            ptf_vals = [p.ptf_tl_per_mwh for p in window_pts if p.ptf_tl_per_mwh is not None]
+            if ptf_vals:
+                avg_ptf = sum(ptf_vals) / len(ptf_vals)
+                savings_tl = round(max(0.0, job["power_kw"] * job["duration_hours"] * (current_ptf - avg_ptf) / 1000), 2)
+
         result[jid] = OptimalWindow(
             start_time=start_time,
             end_time=end_time,
@@ -238,6 +262,7 @@ def _schedule_ortools(
                 f"Global optimizasyon: {start_time.strftime('%d.%m %H:%M')}–{end_time.strftime('%H:%M')}, "
                 f"ortalama {avg_ci} gCO₂/kWh — şu anki değerden %{savings_pct:.0f} tasarruf.{note}"
             ),
+            estimated_savings_tl=savings_tl,
         )
 
     return result
@@ -247,6 +272,8 @@ def _schedule_greedy(
     jobs: list[dict],
     forecast: ForecastResponse,
     current_intensity: float,
+    outage_slots: set | None = None,
+    current_ptf: float | None = None,
 ) -> dict[int, OptimalWindow]:
     _INF = datetime.max.replace(tzinfo=TURKEY_TZ)
     sorted_jobs = sorted(
@@ -258,7 +285,8 @@ def _schedule_greedy(
     results: dict[int, OptimalWindow] = {}
 
     for job in sorted_jobs:
-        available = [p for p in forecast.points if p.timestamp not in used_slots]
+        blocked = used_slots | (outage_slots or set())
+        available = [p for p in forecast.points if p.timestamp not in blocked]
         if not available:
             continue
         filtered = ForecastResponse(generated_at=forecast.generated_at, source=forecast.source, points=available)
@@ -270,6 +298,7 @@ def _schedule_greedy(
                 power_kw=job["power_kw"],
                 current_intensity=current_intensity,
                 cost_weight=job.get("cost_weight", 0.0),
+                current_ptf=current_ptf,
             )
             results[job["id"]] = window
             for p in forecast.points:

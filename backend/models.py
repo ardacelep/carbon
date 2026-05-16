@@ -66,6 +66,7 @@ class OptimalWindow(BaseModel):
     avg_carbon_intensity: float
     estimated_savings_pct: float
     reasoning: str
+    estimated_savings_tl: Optional[float] = None  # ₺ elektrik maliyet tasarrufu
 
 
 class ScheduledJobEntry(BaseModel):
@@ -77,6 +78,7 @@ class ScheduledJobEntry(BaseModel):
     power_kw: float
     avg_carbon_intensity: float
     estimated_savings_pct: float
+    estimated_savings_tl: Optional[float] = None
     status: str
     color: str
     reasoning: str
@@ -89,6 +91,7 @@ class ScheduleSummary(BaseModel):
     total_carbon_saved_kg: float
     total_energy_kwh: float
     avg_savings_pct: float
+    total_cost_saved_tl: Optional[float] = None
 
 
 class ScheduleResponse(BaseModel):
@@ -182,6 +185,7 @@ class SavingsSummary(BaseModel):
     total_energy_kwh: float
     avg_carbon_intensity: float
     best_saving_pct: float
+    total_cost_saved_tl: Optional[float] = None
     period_start: Optional[datetime]
     period_end: Optional[datetime]
 

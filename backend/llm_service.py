@@ -12,8 +12,8 @@ load_dotenv()
 
 _client: AsyncOpenAI | None = None
 
-MODEL = "meta/llama-3.3-70b-instruct"        # chat + function calling
-MODEL_SMALL = "meta/llama-3.1-8b-instruct"  # structured JSON output
+MODEL = os.getenv("LLM_MODEL", "meta/llama-3.3-70b-instruct")              # chat + function calling
+MODEL_SMALL = os.getenv("LLM_MODEL_SMALL", "meta/llama-3.1-8b-instruct")  # structured JSON output
 MAX_TOKENS = 1024
 
 TOOLS = [
@@ -49,7 +49,7 @@ def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
         _client = AsyncOpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
+            base_url=os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1"),
             api_key=os.getenv("NVIDIA_API_KEY"),
         )
     return _client

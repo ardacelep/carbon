@@ -53,8 +53,27 @@ _MOCK_BASELINE: dict[str, float] = {
 
 _SOLAR_PEAK_MOCK = 5000.0  # Mayıs Türkiye tahmini MW
 
+# Türkiye şebekesi için beklenen karbon yoğunluğu aralığı (gCO₂/kWh)
+_CARBON_VALID_RANGE = (50.0, 800.0)
+
+# Saatlik mock PTF (₺/MWh) — gündüz talebi yüksek → fiyat yüksek
+_MOCK_PTF: dict[int, float] = {
+    0: 950.0,  1: 900.0,  2: 870.0,  3: 850.0,  4: 860.0,  5: 920.0,
+    6: 1050.0, 7: 1250.0, 8: 1450.0, 9: 1600.0, 10: 1700.0, 11: 1750.0,
+    12: 1720.0, 13: 1680.0, 14: 1650.0, 15: 1630.0, 16: 1680.0, 17: 1800.0,
+    18: 1900.0, 19: 1950.0, 20: 1850.0, 21: 1600.0, 22: 1300.0, 23: 1050.0,
+}
+
 _cache: dict = {}
 _last_known_mix: dict | None = None
+
+
+def _validate_carbon(value: float, source: str) -> float | None:
+    lo, hi = _CARBON_VALID_RANGE
+    if not (lo <= value <= hi):
+        print(f"[carbon_service] ANOMALİ: {value:.1f} gCO₂/kWh aralık dışı [{lo}, {hi}] — kaynak: {source}")
+        return None
+    return value
 
 
 # --- Cache ---
@@ -173,6 +192,7 @@ def _fallback_forecast(hours: int) -> ForecastResponse:
             carbon_intensity=avg_ci,
             renewable_ratio=avg_rr,
             confidence=_confidence(h),
+            ptf_tl_per_mwh=_MOCK_PTF[hour],
         ))
 
     return ForecastResponse(
@@ -211,6 +231,7 @@ def generate_mock_forecast(hours: int = 24) -> ForecastResponse:
             carbon_intensity=calc["carbon_intensity"],
             renewable_ratio=calc["renewable_ratio"],
             confidence=_confidence(h),
+            ptf_tl_per_mwh=_MOCK_PTF[ts.hour],
         ))
     return ForecastResponse(
         generated_at=datetime.now(tz=TURKEY_TZ),
@@ -243,9 +264,13 @@ def _fetch_current_live() -> CarbonReading:
     _last_known_mix = dict(valid_row)
     calc = calculate_carbon_intensity(valid_row)
 
+    validated = _validate_carbon(calc["carbon_intensity"], "epias:rt-gen")
+    if validated is None:
+        raise ValueError(f"Anomali: {calc['carbon_intensity']:.1f} gCO₂/kWh aralık dışı — fallback devreye girecek")
+
     return CarbonReading(
         timestamp=datetime.fromisoformat(valid_row["date"]),
-        carbon_intensity=calc["carbon_intensity"],
+        carbon_intensity=validated,
         renewable_ratio=calc["renewable_ratio"],
         source="epias",
     )
@@ -363,6 +388,20 @@ async def get_forecast(hours: int = 24) -> ForecastResponse:
     except Exception as e:
         print(f"[carbon_service] get_forecast hatası, fallback kullanılıyor: {e}")
         result = _fallback_forecast(hours)
+
+    # PTF zenginleştirme: gerçek EPİAŞ verisi varsa kullan, yoksa saatlik mock
+    try:
+        from grid_service import get_ptf_hourly
+        ptf_map = await get_ptf_hourly(hours)
+    except Exception:
+        ptf_map = {}
+
+    enriched_points = []
+    for p in result.points:
+        real_ptf = ptf_map.get(p.timestamp) or ptf_map.get(p.timestamp.replace(tzinfo=None))
+        ptf_val = real_ptf or p.ptf_tl_per_mwh or _MOCK_PTF[p.timestamp.hour]
+        enriched_points.append(p.model_copy(update={"ptf_tl_per_mwh": ptf_val}))
+    result = result.model_copy(update={"points": enriched_points})
 
     _cache_set("forecast", result, FORECAST_TTL)
     return result
