@@ -1,6 +1,6 @@
 # Karbon Zeka — Backend API Referansı
 
-**Base URL:** `http://localhost:8000`  
+**Base URL:** `https://undistractedly-gimlety-angelena.ngrok-free.dev`  
 **Format:** JSON (`Content-Type: application/json`)  
 **Auth:** Bearer token — korumalı endpoint'lere her istekte `Authorization: Bearer <token>` header'ı gönderilmeli
 
@@ -600,7 +600,7 @@ data: [DONE]
 **React'ta kullanım:**
 ```js
 async function streamChat(message, history, onToken) {
-  const res = await fetch('http://localhost:8000/api/chat/stream', {
+  const res = await fetch('https://undistractedly-gimlety-angelena.ngrok-free.dev/api/chat/stream', {
     method: 'POST',
     headers: authHeaders(),
     body: JSON.stringify({ message, history }),
@@ -739,7 +739,7 @@ useEffect(() => {
 Uçtan uca minimum akış — kayıt, token alma, iş ekleme:
 
 ```js
-const BASE = 'http://localhost:8000'
+const BASE = 'https://undistractedly-gimlety-angelena.ngrok-free.dev'
 
 // 1. Kayıt veya giriş
 async function login(email, password) {
@@ -820,4 +820,4 @@ async function getSavingsSummary() {
 - **EPİAŞ gecikmesi:** `updated_minutes_ago > 90` ise kullanıcıya uyarı göster
 - **`source` alanı:** `"fallback"` görünce API erişimi yok demektir; veriler yerel JSON'dan geliyor, grafik çalışmaya devam eder
 - **CORS:** Tüm origin'lere açık — deploy sonrası da ek ayar gerekmez
-- **Swagger UI:** `http://localhost:8000/docs` — tüm endpoint'leri tarayıcıdan deneyebilirsin
+- **Swagger UI:** `https://undistractedly-gimlety-angelena.ngrok-free.dev/docs` — tüm endpoint'leri tarayıcıdan deneyebilirsin
