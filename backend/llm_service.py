@@ -36,16 +36,29 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "find_best_window",
-        "description": "Verilen iş yükü için en düşük karbonlu çalışma zamanını hesaplar ve önerir",
+        "description": "Verilen iş yükü için en iyi çalışma zamanını hesaplar ve önerir. DB'ye kayıt yapmaz, sadece analiz eder.",
         "parameters": {"type": "object", "properties": {
             "duration_hours": {"type": "number", "description": "İşin süresi saat cinsinden"},
             "power_kw": {"type": "number", "description": "İşin güç tüketimi kW cinsinden"},
+            "cost_weight": {"type": "number", "description": "0.0=sadece karbon optimize et, 1.0=sadece elektrik maliyetini minimize et, 0.5=dengeli. Varsayılan 0.0", "default": 0.0},
         }, "required": ["duration_hours", "power_kw"]},
     }},
     {"type": "function", "function": {
         "name": "detect_anomaly",
         "description": "Şu anki karbon yoğunluğunun saatlik geçmiş baseline'a göre anormal olup olmadığını Z-score ile tespit eder. Anomali varsa severity ve öneri döndürür.",
         "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "create_job",
+        "description": "Yeni bir iş oluşturur, optimal karbon penceresini hesaplar ve takvime ekler. Kullanıcı bir işi planlamak veya eklemek istediğinde bu aracı kullan.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "İş adı (örn. 'ML Model Eğitimi', 'Veritabanı Yedekleme')"},
+            "duration_hours": {"type": "number", "description": "İşin süresi saat cinsinden (0-72)"},
+            "power_kw": {"type": "number", "description": "İşin güç tüketimi kW cinsinden"},
+            "priority": {"type": "integer", "description": "Öncelik: 1 (düşük) – 5 (acil). Varsayılan 1", "default": 1},
+            "cost_weight": {"type": "number", "description": "0.0=sadece karbon, 1.0=sadece maliyet, 0.5=dengeli. Varsayılan 0.0", "default": 0.0},
+            "deadline": {"type": "string", "description": "Opsiyonel son tarih, ISO-8601 formatında (örn. '2026-05-17T18:00:00+03:00')"},
+        }, "required": ["name", "duration_hours", "power_kw"]},
     }},
 ]
 
@@ -63,7 +76,7 @@ def _get_client() -> AsyncOpenAI:
 _ALLOWED_TOOLS = {t["function"]["name"] for t in TOOLS}
 
 
-async def _execute_tool(name: str, arguments: str) -> dict:
+async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -> dict:
     if name not in _ALLOWED_TOOLS:
         return {"error": f"İzinsiz araç: {name}"}
     args = json.loads(arguments or "{}")
@@ -112,14 +125,19 @@ async def _execute_tool(name: str, arguments: str) -> dict:
         from scheduler import find_optimal_window
         duration = float(args.get("duration_hours", 1))
         power = float(args.get("power_kw", 100))
+        cost_weight = float(args.get("cost_weight", 0.0))
         current = await get_current_carbon()
         forecast = await get_forecast(24)
-        window = find_optimal_window(forecast, duration, None, power, current.carbon_intensity)
+        window = find_optimal_window(
+            forecast, duration, None, power, current.carbon_intensity,
+            cost_weight=cost_weight, current_ptf=None,
+        )
         return {
             "start_time": window.start_time.strftime("%d.%m %H:%M"),
             "end_time": window.end_time.strftime("%H:%M"),
             "avg_carbon_intensity": window.avg_carbon_intensity,
             "estimated_savings_pct": window.estimated_savings_pct,
+            "estimated_savings_tl": window.estimated_savings_tl,
             "reasoning": window.reasoning,
         }
 
@@ -137,6 +155,60 @@ async def _execute_tool(name: str, arguments: str) -> dict:
             "message": r.message,
             "recommendation": r.recommendation,
         }
+
+    if name == "create_job":
+        if not user_id:
+            return {"error": "Kullanıcı kimliği doğrulanamadı, iş oluşturulamadı"}
+        from carbon_service import get_current_carbon, get_forecast
+        from scheduler import find_optimal_window
+        from database import create_job as db_create_job
+        from models import JobCreate
+        from datetime import datetime, timezone, timedelta
+
+        duration = float(args.get("duration_hours", 1))
+        power = float(args.get("power_kw", 100))
+        priority = int(args.get("priority", 1))
+        cost_weight = float(args.get("cost_weight", 0.0))
+        deadline_str = args.get("deadline")
+        deadline = datetime.fromisoformat(deadline_str) if deadline_str else None
+
+        current = await get_current_carbon()
+        forecast = await get_forecast(24)
+        try:
+            window = find_optimal_window(
+                forecast, duration, deadline, power, current.carbon_intensity,
+                cost_weight=cost_weight, current_ptf=None,
+            )
+        except ValueError:
+            window = None
+
+        job = JobCreate(
+            name=args.get("name", "Yeni İş"),
+            duration_hours=duration,
+            power_kw=power,
+            priority=priority,
+            deadline=deadline,
+            cost_weight=cost_weight,
+        )
+        row = await db_create_job(user_id, job, window, None)
+        result = {
+            "job_id": row["id"],
+            "name": row["name"],
+            "status": row["status"],
+            "created_at": row.get("created_at", ""),
+        }
+        if window:
+            result["optimal_window"] = {
+                "start_time": window.start_time.strftime("%d.%m %H:%M"),
+                "end_time": window.end_time.strftime("%H:%M"),
+                "avg_carbon_intensity": window.avg_carbon_intensity,
+                "estimated_savings_pct": window.estimated_savings_pct,
+                "estimated_savings_tl": window.estimated_savings_tl,
+                "reasoning": window.reasoning,
+            }
+        else:
+            result["optimal_window"] = None
+        return result
 
     return {"error": f"Bilinmeyen araç: {name}"}
 
@@ -169,15 +241,24 @@ _SYSTEM_PROMPT = (
     "takip eden bir platformda çalışıyorsun.\n\n"
     "Görevin: Veri merkezi operatörlerine karbon bilinçli iş yükü zamanlaması konusunda Türkçe, "
     "net ve pratik tavsiyeler vermek.\n\n"
-    "Elinde 5 araç var: anlık karbon verisi, 24 saatlik tahmin, şebeke durumu, "
-    "en iyi pencere hesaplama ve anomali tespiti. "
-    "Kullanıcı soru sorduğunda önce gerekli araçları çağır, sonra gerçek verilerle yanıt ver.\n\n"
+    "Elinde 6 araç var:\n"
+    "- get_current_carbon: anlık karbon verisi\n"
+    "- get_forecast: 24 saatlik tahmin\n"
+    "- get_grid_status: şebeke durumu (baraj, PTF fiyatı, stres)\n"
+    "- find_best_window: iş için optimal pencere hesapla (DB'ye kaydetmez, sadece analiz)\n"
+    "- detect_anomaly: anlık karbon değerinin tarihsel baseline'a göre anormal olup olmadığını tespit et\n"
+    "- create_job: iş oluştur ve takvime ekle (DB'ye kaydeder)\n\n"
+    "Kullanıcı bir işi 'ekle', 'planla', 'takvime al', 'oluştur' gibi bir eylem istediğinde "
+    "create_job aracını kullan. Sadece analiz veya öneri istiyorsa find_best_window yeterli.\n\n"
+    "cost_weight parametresi: 0.0=sadece karbon optimize et (varsayılan), "
+    "0.5=karbon ve elektrik maliyetini dengele, 1.0=sadece maliyeti minimize et.\n\n"
     "Yanıtlarında:\n"
-    "- Somut sayılar ver (gCO2/kWh, kg tasarruf, saat)\n"
+    "- Somut sayılar ver (gCO2/kWh, kg tasarruf, saat, ₺ tasarruf)\n"
     "- Maksimum 3 kısa paragraf yaz\n"
-    "- Her zaman Türkçe yanıt ver\n\n"
-    "KRİTİK KURAL: Araç sonuçlarından ve sana verilen verilerden gelen sayısal değerleri "
-    "(gCO₂/kWh, kg CO₂, %, saat) TAM OLARAK kullan. Yuvarlama, tahmin veya değiştirme yapma. "
+    "- Her zaman Türkçe yanıt ver\n"
+    "- İş oluşturduktan sonra kullanıcıya job_id ve pencere bilgisini bildir\n\n"
+    "KRİTİK KURAL: Araç sonuçlarından gelen sayısal değerleri "
+    "(gCO₂/kWh, kg CO₂, %, saat, ₺) TAM OLARAK kullan. Yuvarlama, tahmin veya değiştirme yapma. "
     "Bilmediğin bir değer varsa araç çağır, uydurma."
 )
 
@@ -185,6 +266,7 @@ _SYSTEM_PROMPT = (
 async def get_chat_response_with_tools(
     message: str,
     history: list[dict],
+    user_id: str | None = None,
 ) -> str:
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
     messages += history[-6:]
@@ -208,6 +290,7 @@ async def get_chat_response_with_tools(
                     result = await _execute_tool(
                         tool_call.function.name,
                         tool_call.function.arguments,
+                        user_id=user_id,
                     )
                     messages.append({
                         "role": "tool",
@@ -228,8 +311,9 @@ async def get_chat_response(
     history: list[dict],
     carbon_context: dict,
     grid_context: dict | None = None,
+    user_id: str | None = None,
 ) -> str:
-    return await get_chat_response_with_tools(message, history)
+    return await get_chat_response_with_tools(message, history, user_id=user_id)
 
 
 async def stream_chat_response(

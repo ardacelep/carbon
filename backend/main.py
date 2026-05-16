@@ -548,7 +548,7 @@ async def demo_schedule(user_id: str = Depends(get_current_user)):
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest, user_id: str = Depends(get_current_user)):
     history_dicts = [{"role": m.role, "content": m.content} for m in body.history]
-    reply = await get_chat_response(body.message, history_dicts, {})
+    reply = await get_chat_response(body.message, history_dicts, {}, user_id=user_id)
     return ChatResponse(reply=reply, timestamp=datetime.now(tz=TURKEY_TZ))
 
 
