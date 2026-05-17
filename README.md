@@ -292,8 +292,8 @@ Tam interaktif dokümantasyon: `/docs`
 
 ## Canlı Demo
 
-- **Uygulama:** *(deploy sonrası eklenecek)*
-- **Backend API Docs:** *(deploy sonrası eklenecek)*
+- **Uygulama:** https://axiom-eight-kappa.vercel.app
+- **Backend API Docs:** https://carbon-production-2576.up.railway.app/docs
 
 ---
 
