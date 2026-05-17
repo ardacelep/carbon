@@ -39,6 +39,7 @@ _ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
     "https://undistractedly-gimlety-angelena.ngrok-free.app",
+    *[o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()],
 ]
 
 app.add_middleware(
