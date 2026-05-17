@@ -29,6 +29,7 @@ def _row_to_job_response(row: dict) -> JobResponse:
             end_time=datetime.fromisoformat(row["optimal_end_time"]),
             avg_carbon_intensity=row["avg_carbon_intensity"] or 0.0,
             estimated_savings_pct=row["estimated_savings_pct"] or 0.0,
+            estimated_savings_tl=row.get("estimated_savings_tl"),
             reasoning=row["reasoning"] or "",
         )
 
@@ -75,6 +76,7 @@ async def create_job(
         "scheduled_start": optimal_window.start_time.isoformat() if optimal_window else None,
         "avg_carbon_intensity": optimal_window.avg_carbon_intensity if optimal_window else None,
         "estimated_savings_pct": optimal_window.estimated_savings_pct if optimal_window else None,
+        "estimated_savings_tl": optimal_window.estimated_savings_tl if optimal_window else None,
         "reasoning": optimal_window.reasoning if optimal_window else None,
         "ai_recommendation": ai_recommendation.model_dump_json() if ai_recommendation else None,
     }

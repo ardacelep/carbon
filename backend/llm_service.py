@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import AsyncGenerator
 
 from dotenv import load_dotenv
@@ -123,14 +124,15 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
     if name == "find_best_window":
         from carbon_service import get_current_carbon, get_forecast
         from scheduler import find_optimal_window
-        duration = float(args.get("duration_hours", 1))
-        power = float(args.get("power_kw", 100))
+        duration = max(0.5, float(args.get("duration_hours", 1)))
+        power = max(1.0, float(args.get("power_kw") or 100))
         cost_weight = float(args.get("cost_weight", 0.0))
         current = await get_current_carbon()
         forecast = await get_forecast(24)
+        current_ptf = next((p.ptf_tl_per_mwh for p in forecast.points if p.ptf_tl_per_mwh), None)
         window = find_optimal_window(
             forecast, duration, None, power, current.carbon_intensity,
-            cost_weight=cost_weight, current_ptf=None,
+            cost_weight=cost_weight, current_ptf=current_ptf,
         )
         return {
             "start_time": window.start_time.strftime("%d.%m %H:%M"),
@@ -165,8 +167,8 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
         from models import JobCreate
         from datetime import datetime, timezone, timedelta
 
-        duration = float(args.get("duration_hours", 1))
-        power = float(args.get("power_kw", 100))
+        duration = max(0.5, float(args.get("duration_hours", 1)))
+        power = max(1.0, float(args.get("power_kw") or 100))
         priority = int(args.get("priority", 1))
         cost_weight = float(args.get("cost_weight", 0.0))
         deadline_str = args.get("deadline")
@@ -174,10 +176,11 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
 
         current = await get_current_carbon()
         forecast = await get_forecast(24)
+        current_ptf = next((p.ptf_tl_per_mwh for p in forecast.points if p.ptf_tl_per_mwh), None)
         try:
             window = find_optimal_window(
                 forecast, duration, deadline, power, current.carbon_intensity,
-                cost_weight=cost_weight, current_ptf=None,
+                cost_weight=cost_weight, current_ptf=current_ptf,
             )
         except ValueError:
             window = None
@@ -248,15 +251,19 @@ _SYSTEM_PROMPT = (
     "- find_best_window: iş için optimal pencere hesapla (DB'ye kaydetmez, sadece analiz)\n"
     "- detect_anomaly: anlık karbon değerinin tarihsel baseline'a göre anormal olup olmadığını tespit et\n"
     "- create_job: iş oluştur ve takvime ekle (DB'ye kaydeder)\n\n"
-    "Kullanıcı bir işi 'ekle', 'planla', 'takvime al', 'oluştur' gibi bir eylem istediğinde "
-    "create_job aracını kullan. Sadece analiz veya öneri istiyorsa find_best_window yeterli.\n\n"
+    "ARAÇ SEÇİMİ KURALLARI:\n"
+    "- Kullanıcı 'ekle', 'planla', 'takvime al', 'oluştur', 'schedule' gibi bir eylem istiyorsa "
+    "create_job kullan. Sadece analiz veya öneri istiyorsa find_best_window yeterli.\n"
+    "- Kullanıcı virgülle ayrılmış BİRDEN FAZLA iş adı veriyorsa, her iş için create_job'ı "
+    "AYRI AYRI çağır. Tüm işler tamamlanana kadar durma, yanıt yazma.\n"
+    "- İşleri oluşturduktan sonra hangi işlerin hangi zaman penceresine eklendiğini ve "
+    "beklenen CO₂ tasarrufu yüzdesini Türkçe özetle.\n\n"
     "cost_weight parametresi: 0.0=sadece karbon optimize et (varsayılan), "
     "0.5=karbon ve elektrik maliyetini dengele, 1.0=sadece maliyeti minimize et.\n\n"
     "Yanıtlarında:\n"
     "- Somut sayılar ver (gCO2/kWh, kg tasarruf, saat, ₺ tasarruf)\n"
     "- Maksimum 3 kısa paragraf yaz\n"
-    "- Her zaman Türkçe yanıt ver\n"
-    "- İş oluşturduktan sonra kullanıcıya job_id ve pencere bilgisini bildir\n\n"
+    "- Her zaman Türkçe yanıt ver\n\n"
     "KRİTİK KURAL: Araç sonuçlarından gelen sayısal değerleri "
     "(gCO₂/kWh, kg CO₂, %, saat, ₺) TAM OLARAK kullan. Yuvarlama, tahmin veya değiştirme yapma. "
     "Bilmediğin bir değer varsa araç çağır, uydurma."
@@ -267,20 +274,21 @@ async def get_chat_response_with_tools(
     message: str,
     history: list[dict],
     user_id: str | None = None,
-) -> str:
+) -> tuple[str, bool]:
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
     messages += history[-6:]
     messages.append({"role": "user", "content": message})
+    jobs_created = False
 
     try:
-        for _ in range(5):
+        for _ in range(8):
             response = await _get_client().chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="auto",
                 max_tokens=MAX_TOKENS,
-                temperature=0.7,
+                temperature=0.3,
             )
             choice = response.choices[0]
 
@@ -292,18 +300,20 @@ async def get_chat_response_with_tools(
                         tool_call.function.arguments,
                         user_id=user_id,
                     )
+                    if tool_call.function.name == "create_job" and "job_id" in result:
+                        jobs_created = True
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": json.dumps(result, ensure_ascii=False),
                     })
             else:
-                return choice.message.content.strip()
+                return choice.message.content.strip(), jobs_created
 
     except Exception as e:
         print(f"[llm_service] tool-calling hatası: {e}")
 
-    return "Şu anda yapay zeka servisi kullanılamıyor. Lütfen daha sonra tekrar deneyin."
+    return "Şu anda yapay zeka servisi kullanılamıyor. Lütfen daha sonra tekrar deneyin.", jobs_created
 
 
 async def get_chat_response(
@@ -313,7 +323,8 @@ async def get_chat_response(
     grid_context: dict | None = None,
     user_id: str | None = None,
 ) -> str:
-    return await get_chat_response_with_tools(message, history, user_id=user_id)
+    reply, _ = await get_chat_response_with_tools(message, history, user_id=user_id)
+    return reply
 
 
 async def stream_chat_response(
@@ -321,43 +332,23 @@ async def stream_chat_response(
     history: list[dict],
     carbon_context: dict,
     grid_context: dict | None = None,
+    user_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    # Halüsinasyon önlemi: gerçek EPİAŞ verisini sistem promptuna ekle
-    live_context = ""
     try:
-        from carbon_service import get_current_carbon
-        current = await get_current_carbon()
-        live_context = (
-            f"\n\nAnlık EPİAŞ verisi ({current.timestamp.strftime('%d.%m.%Y %H:%M')} itibarıyla):\n"
-            f"- Karbon yoğunluğu: {current.carbon_intensity:.1f} gCO₂/kWh\n"
-            f"- Yenilenebilir oran: %{current.renewable_ratio * 100:.1f}\n"
-            f"- Kaynak: {current.source}\n"
-            "Bu değerleri yanıtında olduğu gibi kullan."
-        )
-    except Exception:
-        pass
-
-    messages = [{"role": "system", "content": _SYSTEM_PROMPT + live_context}]
-    messages += history[-6:]
-    messages.append({"role": "user", "content": message})
-
-    try:
-        stream = await _get_client().chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-            temperature=0.7,
-            stream=True,
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            if delta:
-                yield f"data: {json.dumps({'token': delta})}\n\n"
+        reply, jobs_created = await get_chat_response_with_tools(message, history, user_id=user_id)
     except Exception as e:
         print(f"[llm_service] streaming hatası: {e}")
         yield f"data: {json.dumps({'error': 'Yapay zeka servisi şu anda kullanılamıyor.'})}\n\n"
-    finally:
         yield "data: [DONE]\n\n"
+        return
+
+    for word in reply.split(" "):
+        yield f"data: {json.dumps({'token': word + ' '})}\n\n"
+
+    if jobs_created:
+        yield f"data: {json.dumps({'jobs_changed': True})}\n\n"
+
+    yield "data: [DONE]\n\n"
 
 
 async def _analyze_carbon_context(
@@ -401,6 +392,52 @@ _RETRY_CONFIDENCE = [0.92, 0.75, 0.58]
 _RETRY_TEMPERATURES = [0.3, 0.5, 0.7]
 
 
+def _parse_llm_json(text: str) -> dict:
+    """LLM JSON çıktısını ayrıştırır; 3 strateji dener."""
+    # 1. Kod bloğu temizle ve JSON nesnesini kes
+    if "```" in text:
+        for part in text.split("```")[1:]:
+            stripped = part.lstrip("json").strip()
+            if stripped.startswith("{"):
+                text = stripped
+                break
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start != -1 and end > start:
+        candidate = text[start:end]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        # 2. Kontrol karakterlerini temizle ve tekrar dene
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", candidate)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Regex ile alan bazlı çıkarma (son çare)
+    def _rstr(key):
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+        return m.group(1) if m else ""
+
+    def _rfloat(key):
+        m = re.search(rf'"{key}"\s*:\s*([0-9]+(?:\.[0-9]+)?)', text)
+        return float(m.group(1)) if m else 0.0
+
+    result = {
+        "window":      _rstr("window"),
+        "date":        _rstr("date"),
+        "savings_kg":  _rfloat("savings_kg"),
+        "savings_pct": _rfloat("savings_pct"),
+        "reasoning":   _rstr("reasoning"),
+        "action":      _rstr("action"),
+    }
+    if result["window"] or result["reasoning"]:
+        return result
+    raise ValueError("JSON ayrıştırılamadı")
+
+
 async def get_job_recommendation(
     job_name: str,
     duration_hours: float,
@@ -439,22 +476,21 @@ async def get_job_recommendation(
 
     for temp, conf in zip(_RETRY_TEMPERATURES, _RETRY_CONFIDENCE):
         try:
-            response = await _get_client().chat.completions.create(
+            kwargs = dict(
                 model=MODEL_SMALL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=512,
                 temperature=temp,
             )
+            try:
+                response = await _get_client().chat.completions.create(
+                    **kwargs, response_format={"type": "json_object"}
+                )
+            except Exception:
+                response = await _get_client().chat.completions.create(**kwargs)
             text = response.choices[0].message.content.strip()
-            if "```" in text:
-                text = text.split("```")[1].lstrip("json").strip()
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start != -1 and end > start:
-                text = text[start:end]
-            data = json.loads(text)
-            # Grounding: LLM'in ürettiği sayıları algoritmik değerlerle sabitle.
-            # reasoning ve action LLM'den gelir; sayılar ve pencere değişmez.
+            data = _parse_llm_json(text)
+            # Grounding: LLM sayılarını algoritmik değerlerle sabitle; reasoning/action LLM'den gelir.
             data["savings_kg"]       = round(saving_kg, 2)
             data["savings_pct"]      = round(optimal_window.estimated_savings_pct, 1)
             data["window"]           = f"{start_str}–{end_str}"

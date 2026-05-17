@@ -14,7 +14,7 @@ from models import (
     ChatRequest, ChatResponse,
     CurrentCarbonResponse, ForecastResponse, SavingsSummary,
     GridStatus,
-    ScheduleResponse, ScheduledJobEntry, ScheduleSummary, ScheduleApproveRequest,
+    ScheduleResponse, ScheduledJobEntry, ScheduleSummary, ScheduleApproveRequest, OptimalWindow,
     AnomalyReport, ForecastAccuracyResponse,
 )
 from carbon_service import get_current_carbon, get_forecast
@@ -123,17 +123,23 @@ async def get_current_user(authorization: str = Header(...)) -> UserContext:
 
 @app.post("/api/auth/signup", response_model=TokenResponse, status_code=201)
 async def signup(body: UserCreate):
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     try:
-        supabase = await get_supabase()
-        response = await supabase.auth.sign_up({"email": body.email, "password": body.password})
-        if not response.user:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(
+                f"{supabase_url}/auth/v1/signup",
+                headers={"apikey": supabase_key, "Content-Type": "application/json"},
+                json={"email": body.email, "password": body.password},
+            )
+        if r.status_code not in (200, 201):
             raise HTTPException(status_code=400, detail="Kayıt başarısız")
-        if not response.session:
+        data = r.json()
+        token = data.get("access_token")
+        user_id = data.get("id") or data.get("user", {}).get("id")
+        if not token or not user_id:
             raise HTTPException(status_code=400, detail="Email onayı gerekiyor — Supabase'de email onayını kapatın")
-        return TokenResponse(
-            access_token=response.session.access_token,
-            user_id=str(response.user.id),
-        )
+        return TokenResponse(access_token=token, user_id=str(user_id))
     except HTTPException:
         raise
     except Exception as e:
@@ -143,15 +149,23 @@ async def signup(body: UserCreate):
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(body: UserLogin):
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     try:
-        supabase = await get_supabase()
-        response = await supabase.auth.sign_in_with_password({"email": body.email, "password": body.password})
-        if not response.session:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(
+                f"{supabase_url}/auth/v1/token?grant_type=password",
+                headers={"apikey": supabase_key, "Content-Type": "application/json"},
+                json={"email": body.email, "password": body.password},
+            )
+        if r.status_code != 200:
             raise HTTPException(status_code=401, detail="Geçersiz email veya şifre")
-        return TokenResponse(
-            access_token=response.session.access_token,
-            user_id=str(response.user.id),
-        )
+        data = r.json()
+        token = data.get("access_token")
+        user_id = data.get("user", {}).get("id")
+        if not token or not user_id:
+            raise HTTPException(status_code=401, detail="Geçersiz email veya şifre")
+        return TokenResponse(access_token=token, user_id=str(user_id))
     except HTTPException:
         raise
     except Exception:
@@ -434,8 +448,8 @@ def _build_outage_slots(grid: GridStatus) -> set:
 @app.get("/api/schedule", response_model=ScheduleResponse)
 async def get_schedule(ctx: UserContext = Depends(get_current_user)):
     rows = await get_jobs(ctx.user_id)
-    active = [r for r in rows if r["status"] in ("pending", "scheduled")]
-    if not active:
+    all_active = [r for r in rows if r["status"] in ("pending", "scheduled", "running")]
+    if not all_active:
         return ScheduleResponse(
             generated_at=datetime.now(tz=TURKEY_TZ),
             jobs=[],
@@ -443,32 +457,55 @@ async def get_schedule(ctx: UserContext = Depends(get_current_user)):
                                     total_carbon_saved_kg=0.0, total_energy_kwh=0.0, avg_savings_pct=0.0),
         )
 
-    current = await get_current_carbon()
-    forecast = await get_forecast(24)
+    scheduled_rows = [r for r in all_active if r["status"] in ("scheduled", "running")]
+    pending_rows   = [r for r in all_active if r["status"] == "pending"]
 
-    outage_slots: set = set()
-    current_ptf = None
-    try:
-        grid = await get_grid_status()
-        current_ptf = grid.ptf_tl_per_mwh
-        outage_slots = _build_outage_slots(grid)
-    except Exception:
-        pass
+    windows: dict[int, OptimalWindow] = {}
 
-    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity, outage_slots or None, current_ptf)
-    return _build_schedule_response(active, windows)
+    # Onaylı/çalışan işler için DB'deki kayıtlı pencereyi kullan (yeniden hesaplama yok)
+    for row in scheduled_rows:
+        if row.get("scheduled_start"):
+            start = datetime.fromisoformat(row["scheduled_start"])
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=TURKEY_TZ)
+            end = start + timedelta(hours=row["duration_hours"])
+            windows[row["id"]] = OptimalWindow(
+                start_time=start,
+                end_time=end,
+                avg_carbon_intensity=row.get("avg_carbon_intensity") or 0.0,
+                estimated_savings_pct=row.get("estimated_savings_pct") or 0.0,
+                reasoning=row.get("reasoning") or "Onaylanmış pencere.",
+            )
+
+    # Bekleyen işler için OR-Tools ile taze hesaplama
+    if pending_rows:
+        current = await get_current_carbon()
+        forecast = await get_forecast(24)
+        outage_slots: set = set()
+        current_ptf = None
+        try:
+            grid = await get_grid_status()
+            current_ptf = grid.ptf_tl_per_mwh
+            outage_slots = _build_outage_slots(grid)
+        except Exception:
+            pass
+        pending_windows = schedule_multiple_jobs(pending_rows, forecast, current.carbon_intensity, outage_slots or None, current_ptf)
+        windows.update(pending_windows)
+
+    return _build_schedule_response(all_active, windows)
 
 
 @app.post("/api/schedule/approve", response_model=ScheduleResponse)
 async def approve_schedule(body: ScheduleApproveRequest, ctx: UserContext = Depends(get_current_user)):
     rows = await get_jobs(ctx.user_id)
-    active = [r for r in rows if r["status"] in ("pending", "scheduled")]
+    # Sadece bekleyen işleri optimize et; onaylı/çalışan işlere dokunma
+    active = [r for r in rows if r["status"] == "pending"]
 
     if body.job_ids:
         active = [r for r in active if r["id"] in body.job_ids]
 
     if not active:
-        raise HTTPException(status_code=404, detail="Onaylanacak iş bulunamadı")
+        raise HTTPException(status_code=404, detail="Onaylanacak bekleyen iş bulunamadı")
 
     current = await get_current_carbon()
     forecast = await get_forecast(24)
@@ -572,7 +609,7 @@ async def chat_stream(body: ChatRequest, ctx: UserContext = Depends(get_current_
     history_dicts = [{"role": m.role, "content": m.content} for m in body.history]
 
     return StreamingResponse(
-        stream_chat_response(body.message, history_dicts, {}),
+        stream_chat_response(body.message, history_dicts, {}, user_id=ctx.user_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -614,6 +651,9 @@ async def savings_summary(ctx: UserContext = Depends(get_current_user)):
 
     created_dates = [datetime.fromisoformat(r["created_at"]) for r in rows]
 
+    tl_vals = [r["estimated_savings_tl"] for r in optimized if r.get("estimated_savings_tl")]
+    total_cost_saved_tl = round(sum(tl_vals), 2) if tl_vals else None
+
     return SavingsSummary(
         total_jobs=len(rows),
         optimized_jobs=len(optimized),
@@ -621,6 +661,7 @@ async def savings_summary(ctx: UserContext = Depends(get_current_user)):
         total_energy_kwh=round(total_energy_kwh, 2),
         avg_carbon_intensity=round(avg_carbon, 1),
         best_saving_pct=round(best_saving_pct, 1),
+        total_cost_saved_tl=total_cost_saved_tl,
         period_start=min(created_dates),
         period_end=max(created_dates),
     )
