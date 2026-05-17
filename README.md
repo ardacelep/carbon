@@ -2,7 +2,7 @@
 
 **100 StaryUP Bootcamp Hackathon** · 15–17 Mayıs 2026 · YTÜ Davutpaşa · NVIDIA Altyapısıyla
 
-**Tema:** `A2` Sürdürülebilirlik + `B4` Veri Merkezi + `C1` Metin üretimi/sohbet + `C7` Ajan ve araç kullanımı + `D4` Zaman serisi tahmini + `D5` Anomali tespiti
+**Tema:** `A2` Sürdürülebilirlik + `B4` Veri Merkezi + `C1` Metin üretimi/sohbet + `C7` Ajan ve araç kullanımı + `D4` Zaman serisi tahmini + `D5` Anomali tespiti + `D7` Öneri sistemi
 
 ---
 
