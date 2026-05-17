@@ -1,4 +1,5 @@
 import os
+import math
 import httpx
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
@@ -9,12 +10,12 @@ from dotenv import load_dotenv
 
 from models import (
     UserCreate, UserLogin, TokenResponse,
-    JobCreate, JobResponse, JobListResponse, JobStatusUpdate,
+    JobCreate, JobResponse, JobListResponse, JobStatusUpdate, JobPinUpdate,
     JobTemplate, JobAnalyzeRequest, JobAnalyzeResponse,
     ChatRequest, ChatResponse,
     CurrentCarbonResponse, ForecastResponse, SavingsSummary,
     GridStatus,
-    ScheduleResponse, ScheduledJobEntry, ScheduleSummary, ScheduleApproveRequest, OptimalWindow,
+    ScheduleResponse, ScheduledJobEntry, ScheduleSummary, OptimalWindow,
     AnomalyReport, ForecastAccuracyResponse,
 )
 from carbon_service import get_current_carbon, get_forecast
@@ -220,10 +221,23 @@ async def create_job_endpoint(body: JobCreate, ctx: UserContext = Depends(get_cu
     current = await get_current_carbon()
     forecast = await get_forecast(24)
 
+    # Yeni iş için geçici (provisional) yerleşim — mevcut işlerin dolu slotlarını atla.
+    # Bu kilitleme değil; kullanıcı "Yeniden Optimize Et" ile tüm planı yeniden kurabilir.
+    place_forecast = forecast
+    try:
+        occupied = _occupied_slots(await get_jobs(ctx.user_id))
+        free_points = [p for p in forecast.points if _slot_key(p.timestamp) not in occupied]
+        if len(free_points) >= max(1, math.ceil(body.duration_hours)):
+            place_forecast = ForecastResponse(
+                generated_at=forecast.generated_at, source=forecast.source, points=free_points
+            )
+    except Exception as e:
+        print(f"[main] provisional yerleşim hatası: {e}")
+
     optimal_window = None
     try:
         optimal_window = find_optimal_window(
-            forecast=forecast,
+            forecast=place_forecast,
             duration_hours=body.duration_hours,
             deadline=body.deadline,
             power_kw=body.power_kw,
@@ -405,6 +419,7 @@ def _build_schedule_response(rows: list[dict], windows: dict[int, object]) -> Sc
             estimated_savings_pct=window.estimated_savings_pct,
             estimated_savings_tl=window.estimated_savings_tl,
             status=row["status"],
+            pinned=bool(row.get("pinned")),
             color=_carbon_color(window.avg_carbon_intensity),
             reasoning=window.reasoning,
             ai_recommendation=row.get("ai_recommendation"),
@@ -445,70 +460,98 @@ def _build_outage_slots(grid: GridStatus) -> set:
     return slots
 
 
+def _slot_key(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=TURKEY_TZ)
+    return ts.replace(minute=0, second=0, microsecond=0)
+
+
+def _occupied_slots(rows: list[dict]) -> set:
+    """Aktif (planlanmış/çalışan) işlerin kapladığı saat slotları."""
+    occupied: set = set()
+    for r in rows:
+        if r["status"] not in ("scheduled", "running") or not r.get("scheduled_start"):
+            continue
+        start = datetime.fromisoformat(r["scheduled_start"])
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=TURKEY_TZ)
+        for h in range(max(1, math.ceil(r["duration_hours"]))):
+            occupied.add(_slot_key(start + timedelta(hours=h)))
+    return occupied
+
+
+def _window_from_row(row: dict) -> OptimalWindow:
+    """DB'de kayıtlı yerleşimden OptimalWindow kur (yeniden hesaplama yok)."""
+    start = datetime.fromisoformat(row["scheduled_start"])
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=TURKEY_TZ)
+    end = start + timedelta(hours=row["duration_hours"])
+    return OptimalWindow(
+        start_time=start,
+        end_time=end,
+        avg_carbon_intensity=row.get("avg_carbon_intensity") or 0.0,
+        estimated_savings_pct=row.get("estimated_savings_pct") or 0.0,
+        estimated_savings_tl=row.get("estimated_savings_tl"),
+        reasoning=row.get("reasoning") or "Planlanmış pencere.",
+    )
+
+
+def _fixed_interval_for_row(row: dict, base_ts: datetime, n_slots: int) -> tuple[int, int] | None:
+    """Sabit işi (çalışan/sabitlenmiş/imminent) forecast slot aralığına çevir."""
+    if not row.get("scheduled_start"):
+        return None
+    start = datetime.fromisoformat(row["scheduled_start"])
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=TURKEY_TZ)
+    idx = round((start - base_ts).total_seconds() / 3600)
+    dur = max(1, math.ceil(row["duration_hours"]))
+    end = idx + dur
+    if end <= 0 or idx >= n_slots:
+        return None
+    idx = max(0, idx)
+    return (idx, min(end, n_slots) - idx)
+
+
 @app.get("/api/schedule", response_model=ScheduleResponse)
 async def get_schedule(ctx: UserContext = Depends(get_current_user)):
+    """Saf DB okuması — kayıtlı plana göre takvimi döndürür, yeniden hesaplama yapmaz."""
     rows = await get_jobs(ctx.user_id)
-    all_active = [r for r in rows if r["status"] in ("pending", "scheduled", "running")]
-    if not all_active:
+    placed = [
+        r for r in rows
+        if r["status"] in ("pending", "scheduled", "running") and r.get("scheduled_start")
+    ]
+    if not placed:
         return ScheduleResponse(
             generated_at=datetime.now(tz=TURKEY_TZ),
             jobs=[],
             summary=ScheduleSummary(total_jobs=0, scheduled_jobs=0,
                                     total_carbon_saved_kg=0.0, total_energy_kwh=0.0, avg_savings_pct=0.0),
         )
-
-    scheduled_rows = [r for r in all_active if r["status"] in ("scheduled", "running")]
-    pending_rows   = [r for r in all_active if r["status"] == "pending"]
-
-    windows: dict[int, OptimalWindow] = {}
-
-    # Onaylı/çalışan işler için DB'deki kayıtlı pencereyi kullan (yeniden hesaplama yok)
-    for row in scheduled_rows:
-        if row.get("scheduled_start"):
-            start = datetime.fromisoformat(row["scheduled_start"])
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=TURKEY_TZ)
-            end = start + timedelta(hours=row["duration_hours"])
-            windows[row["id"]] = OptimalWindow(
-                start_time=start,
-                end_time=end,
-                avg_carbon_intensity=row.get("avg_carbon_intensity") or 0.0,
-                estimated_savings_pct=row.get("estimated_savings_pct") or 0.0,
-                reasoning=row.get("reasoning") or "Onaylanmış pencere.",
-            )
-
-    # Bekleyen işler için OR-Tools ile taze hesaplama
-    if pending_rows:
-        current = await get_current_carbon()
-        forecast = await get_forecast(24)
-        outage_slots: set = set()
-        current_ptf = None
-        try:
-            grid = await get_grid_status()
-            current_ptf = grid.ptf_tl_per_mwh
-            outage_slots = _build_outage_slots(grid)
-        except Exception:
-            pass
-        pending_windows = schedule_multiple_jobs(pending_rows, forecast, current.carbon_intensity, outage_slots or None, current_ptf)
-        windows.update(pending_windows)
-
-    return _build_schedule_response(all_active, windows)
+    windows = {r["id"]: _window_from_row(r) for r in placed}
+    return _build_schedule_response(placed, windows)
 
 
-@app.post("/api/schedule/approve", response_model=ScheduleResponse)
-async def approve_schedule(body: ScheduleApproveRequest, ctx: UserContext = Depends(get_current_user)):
+@app.post("/api/schedule/optimize", response_model=ScheduleResponse)
+async def optimize_schedule(ctx: UserContext = Depends(get_current_user)):
+    """
+    Tüm planı yeniden optimize eder. Çalışan, sabitlenmiş (pinned) ve başlamak üzere
+    olan işler sabit engel sayılır — taşınmaz, üstüne iş gelmez. Geri kalan işler
+    OR-Tools ile en güncel tahmine göre yeniden yerleştirilir.
+    """
     rows = await get_jobs(ctx.user_id)
-    # Sadece bekleyen işleri optimize et; onaylı/çalışan işlere dokunma
-    active = [r for r in rows if r["status"] == "pending"]
-
-    if body.job_ids:
-        active = [r for r in active if r["id"] in body.job_ids]
-
+    active = [r for r in rows if r["status"] in ("pending", "scheduled", "running")]
     if not active:
-        raise HTTPException(status_code=404, detail="Onaylanacak bekleyen iş bulunamadı")
+        raise HTTPException(status_code=404, detail="Optimize edilecek iş bulunamadı")
 
     current = await get_current_carbon()
     forecast = await get_forecast(24)
+    if not forecast.points:
+        raise HTTPException(status_code=503, detail="Tahmin verisi yetersiz")
+
+    base_ts = forecast.points[0].timestamp
+    if base_ts.tzinfo is None:
+        base_ts = base_ts.replace(tzinfo=TURKEY_TZ)
+    n_slots = len(forecast.points)
 
     outage_slots: set = set()
     current_ptf = None
@@ -519,23 +562,64 @@ async def approve_schedule(body: ScheduleApproveRequest, ctx: UserContext = Depe
     except Exception:
         pass
 
-    windows = schedule_multiple_jobs(active, forecast, current.carbon_intensity, outage_slots or None, current_ptf)
-
-    now = datetime.now(tz=TURKEY_TZ)
-    for i, row in enumerate(active):
-        window = windows.get(row["id"])
-        if not window:
+    # Sabit (taşınmaz) vs taşınabilir iş ayrımı
+    imminent_cutoff = datetime.now(tz=TURKEY_TZ) + timedelta(hours=1)
+    movable: list[dict] = []
+    fixed: list[dict] = []
+    for r in active:
+        if r["status"] == "running" or r.get("pinned"):
+            fixed.append(r)
             continue
-        if body.demo_mode:
-            # Demo: ilk iş 15s, sonrakiler sırayla 90s arayla
-            start = now + timedelta(seconds=15 + i * 90)
-        else:
-            start = window.start_time
-        await update_job(row["id"], ctx.user_id, {"scheduled_start": start.isoformat(), "status": "scheduled"})
+        start_iso = r.get("scheduled_start")
+        if start_iso:
+            st = datetime.fromisoformat(start_iso)
+            if st.tzinfo is None:
+                st = st.replace(tzinfo=TURKEY_TZ)
+            if st <= imminent_cutoff:
+                fixed.append(r)
+                continue
+        movable.append(r)
 
-    updated_rows = await get_jobs(ctx.user_id)
-    active_updated = [r for r in updated_rows if r["id"] in {r["id"] for r in active}]
-    return _build_schedule_response(active_updated, windows)
+    fixed_intervals = [
+        iv for iv in (_fixed_interval_for_row(r, base_ts, n_slots) for r in fixed) if iv
+    ]
+
+    if movable:
+        windows = schedule_multiple_jobs(
+            movable, forecast, current.carbon_intensity,
+            outage_slots or None, current_ptf, fixed_intervals or None,
+        )
+        for row in movable:
+            w = windows.get(row["id"])
+            if not w:
+                continue
+            await update_job(row["id"], ctx.user_id, {
+                "status": "scheduled",
+                "scheduled_start": w.start_time.isoformat(),
+                "optimal_start_time": w.start_time.isoformat(),
+                "optimal_end_time": w.end_time.isoformat(),
+                "avg_carbon_intensity": w.avg_carbon_intensity,
+                "estimated_savings_pct": w.estimated_savings_pct,
+                "estimated_savings_tl": w.estimated_savings_tl,
+                "reasoning": w.reasoning,
+            })
+
+    updated = await get_jobs(ctx.user_id)
+    active_ids = {r["id"] for r in active}
+    placed = [
+        r for r in updated
+        if r["id"] in active_ids and r.get("scheduled_start")
+    ]
+    fresh_windows = {r["id"]: _window_from_row(r) for r in placed}
+    return _build_schedule_response(placed, fresh_windows)
+
+
+@app.patch("/api/jobs/{job_id}/pin", response_model=JobResponse)
+async def update_job_pin(job_id: int, body: JobPinUpdate, ctx: UserContext = Depends(get_current_user)):
+    row = await update_job(job_id, ctx.user_id, {"pinned": body.pinned})
+    if not row:
+        raise HTTPException(status_code=404, detail="İş bulunamadı")
+    return _row_to_job_response(row)
 
 
 JOB_TEMPLATES = [

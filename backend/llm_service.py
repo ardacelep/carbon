@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 from pydantic import ValidationError
 
 from models import JobRecommendation, OptimalWindow
+from workload_profiles import WORKLOAD_TYPES, resolve_power_kw
 
 load_dotenv()
 
@@ -39,10 +40,12 @@ TOOLS = [
         "name": "find_best_window",
         "description": "Verilen iş yükü için en iyi çalışma zamanını hesaplar ve önerir. DB'ye kayıt yapmaz, sadece analiz eder.",
         "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "İş adı (varsa) — güç tahmini için kullanılır"},
             "duration_hours": {"type": "number", "description": "İşin süresi saat cinsinden"},
-            "power_kw": {"type": "number", "description": "İşin güç tüketimi kW cinsinden"},
+            "power_kw": {"type": "number", "description": "İşin güç tüketimi kW. OPSİYONEL — kullanıcı kW değerini açıkça söylemediyse boş bırak; sistem iş tipinden hesaplar."},
+            "workload_type": {"type": "string", "enum": WORKLOAD_TYPES, "description": "İş yükü tipi. power_kw verilmediyse iş adına/tanımına göre seç — güç tüketimi bu tipten belirlenir."},
             "cost_weight": {"type": "number", "description": "0.0=sadece karbon optimize et, 1.0=sadece elektrik maliyetini minimize et, 0.5=dengeli. Varsayılan 0.0", "default": 0.0},
-        }, "required": ["duration_hours", "power_kw"]},
+        }, "required": ["duration_hours"]},
     }},
     {"type": "function", "function": {
         "name": "detect_anomaly",
@@ -55,11 +58,12 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "İş adı (örn. 'ML Model Eğitimi', 'Veritabanı Yedekleme')"},
             "duration_hours": {"type": "number", "description": "İşin süresi saat cinsinden (0-72)"},
-            "power_kw": {"type": "number", "description": "İşin güç tüketimi kW cinsinden"},
+            "power_kw": {"type": "number", "description": "İşin güç tüketimi kW. OPSİYONEL — kullanıcı kW değerini açıkça söylemediyse boş bırak; sistem iş tipinden hesaplar. Sayı UYDURMA."},
+            "workload_type": {"type": "string", "enum": WORKLOAD_TYPES, "description": "İş yükü tipi. power_kw verilmediyse iş adına/tanımına göre seç — güç tüketimi bu tipten belirlenir."},
             "priority": {"type": "integer", "description": "Öncelik: 1 (düşük) – 5 (acil). Varsayılan 1", "default": 1},
             "cost_weight": {"type": "number", "description": "0.0=sadece karbon, 1.0=sadece maliyet, 0.5=dengeli. Varsayılan 0.0", "default": 0.0},
             "deadline": {"type": "string", "description": "Opsiyonel son tarih, ISO-8601 formatında (örn. '2026-05-17T18:00:00+03:00')"},
-        }, "required": ["name", "duration_hours", "power_kw"]},
+        }, "required": ["name", "duration_hours"]},
     }},
 ]
 
@@ -125,7 +129,8 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
         from carbon_service import get_current_carbon, get_forecast
         from scheduler import find_optimal_window
         duration = max(0.5, float(args.get("duration_hours", 1)))
-        power = max(1.0, float(args.get("power_kw") or 100))
+        pw = resolve_power_kw(args.get("name"), args.get("power_kw"), args.get("workload_type"))
+        power = pw["power_kw"]
         cost_weight = float(args.get("cost_weight", 0.0))
         current = await get_current_carbon()
         forecast = await get_forecast(24)
@@ -141,6 +146,10 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
             "estimated_savings_pct": window.estimated_savings_pct,
             "estimated_savings_tl": window.estimated_savings_tl,
             "reasoning": window.reasoning,
+            "power_kw": power,
+            "workload_type": pw["workload_type"],
+            "workload_label": pw["label"],
+            "power_source": pw["source"],
         }
 
     if name == "detect_anomaly":
@@ -168,7 +177,8 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
         from datetime import datetime, timezone, timedelta
 
         duration = max(0.5, float(args.get("duration_hours", 1)))
-        power = max(1.0, float(args.get("power_kw") or 100))
+        pw = resolve_power_kw(args.get("name"), args.get("power_kw"), args.get("workload_type"))
+        power = pw["power_kw"]
         priority = int(args.get("priority", 1))
         cost_weight = float(args.get("cost_weight", 0.0))
         deadline_str = args.get("deadline")
@@ -199,6 +209,10 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
             "name": row["name"],
             "status": row["status"],
             "created_at": row.get("created_at", ""),
+            "power_kw": power,
+            "workload_type": pw["workload_type"],
+            "workload_label": pw["label"],
+            "power_source": pw["source"],
         }
         if window:
             result["optimal_window"] = {
@@ -260,14 +274,40 @@ _SYSTEM_PROMPT = (
     "beklenen CO₂ tasarrufu yüzdesini Türkçe özetle.\n\n"
     "cost_weight parametresi: 0.0=sadece karbon optimize et (varsayılan), "
     "0.5=karbon ve elektrik maliyetini dengele, 1.0=sadece maliyeti minimize et.\n\n"
+    "GÜÇ TÜKETİMİ (power_kw) KURALLARI:\n"
+    "- Kullanıcı işin gücünü (kW) AÇIKÇA söylemediyse power_kw'yi BOŞ bırak — sayı UYDURMA.\n"
+    "- Bunun yerine işin adına/tanımına bakıp workload_type seç: ml_training, fine_tuning, "
+    "inference, batch_processing, database, backup, log_processing, sync, other. "
+    "Güç tüketimini sistem bu tipe göre belirler.\n"
+    "- Araç sonucunda power_source 'inferred' veya 'workload_type' ise, kullanıcıya hangi "
+    "güç değerini neden varsaydığını belirt — örn. '~300 kW (ML model eğitimi tipik değeri) "
+    "varsaydım; farklıysa kW belirterek düzeltebilirsiniz.'\n\n"
     "Yanıtlarında:\n"
     "- Somut sayılar ver (gCO2/kWh, kg tasarruf, saat, ₺ tasarruf)\n"
     "- Maksimum 3 kısa paragraf yaz\n"
     "- Her zaman Türkçe yanıt ver\n\n"
     "KRİTİK KURAL: Araç sonuçlarından gelen sayısal değerleri "
     "(gCO₂/kWh, kg CO₂, %, saat, ₺) TAM OLARAK kullan. Yuvarlama, tahmin veya değiştirme yapma. "
-    "Bilmediğin bir değer varsa araç çağır, uydurma."
+    "Bilmediğin bir değer varsa araç çağır, uydurma.\n\n"
+    "KESİNLİKLE YASAK: JSON, Python kodu, araç şeması veya herhangi bir yapılandırılmış veri "
+    "metni olarak çıktı verme. Araçları YALNIZCA API'nin function calling mekanizması üzerinden "
+    "çağır — asla metin içinde yazma. Yanıtın her zaman doğal Türkçe olmalı."
 )
+
+
+def _looks_like_tool_call_json(text: str) -> bool:
+    stripped = text.strip()
+    if not (stripped.startswith("[") or stripped.startswith("{")):
+        return False
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, list):
+            return any(isinstance(i, dict) and ("type" in i or "name" in i) for i in parsed)
+        if isinstance(parsed, dict):
+            return "type" in parsed or "name" in parsed
+    except Exception:
+        pass
+    return '"type": "function"' in text or '"name": "create_job"' in text
 
 
 async def get_chat_response_with_tools(
@@ -308,7 +348,19 @@ async def get_chat_response_with_tools(
                         "content": json.dumps(result, ensure_ascii=False),
                     })
             else:
-                return choice.message.content.strip(), jobs_created
+                content = choice.message.content.strip()
+                if _looks_like_tool_call_json(content):
+                    print("[llm_service] Hallüsinasyon tespit edildi: araç JSON metin olarak çıktı")
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Türkçe, doğal dilde yanıt ver. JSON veya kod yazma. "
+                            "İş oluşturmak istiyorsan function calling kullan, metin olarak yazma."
+                        ),
+                    })
+                    continue
+                return content, jobs_created
 
     except Exception as e:
         print(f"[llm_service] tool-calling hatası: {e}")

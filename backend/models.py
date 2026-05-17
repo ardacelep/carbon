@@ -51,6 +51,10 @@ class JobStatusUpdate(BaseModel):
     status: str = Field(..., pattern="^(pending|scheduled|running|completed|cancelled)$")
 
 
+class JobPinUpdate(BaseModel):
+    pinned: bool
+
+
 class JobCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     duration_hours: float = Field(..., gt=0, le=72)
@@ -80,6 +84,7 @@ class ScheduledJobEntry(BaseModel):
     estimated_savings_pct: float
     estimated_savings_tl: Optional[float] = None
     status: str
+    pinned: bool = False
     color: str
     reasoning: str
     ai_recommendation: Optional[str]
@@ -124,6 +129,7 @@ class JobResponse(BaseModel):
     priority: int
     power_kw: float
     status: str
+    pinned: bool = False
     created_at: datetime
     scheduled_start: Optional[datetime]
     optimal_window: Optional[OptimalWindow]

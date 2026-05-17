@@ -121,14 +121,15 @@ def schedule_multiple_jobs(
     current_intensity: float,
     outage_slots: set | None = None,
     current_ptf: float | None = None,
+    fixed_intervals: list[tuple[int, int]] | None = None,
 ) -> dict[int, OptimalWindow]:
     try:
-        result = _schedule_ortools(jobs, forecast, current_intensity, outage_slots, current_ptf)
+        result = _schedule_ortools(jobs, forecast, current_intensity, outage_slots, current_ptf, fixed_intervals)
         print(f"[scheduler] OR-Tools: {len(result)}/{len(jobs)} iş planlandı")
         return result
     except Exception as e:
         print(f"[scheduler] OR-Tools başarısız ({e}), greedy fallback devreye giriyor")
-        return _schedule_greedy(jobs, forecast, current_intensity, outage_slots, current_ptf)
+        return _schedule_greedy(jobs, forecast, current_intensity, outage_slots, current_ptf, fixed_intervals)
 
 
 def _schedule_ortools(
@@ -137,6 +138,7 @@ def _schedule_ortools(
     current_intensity: float,
     outage_slots: set | None = None,
     current_ptf: float | None = None,
+    fixed_intervals: list[tuple[int, int]] | None = None,
 ) -> dict[int, OptimalWindow]:
     from ortools.sat.python import cp_model
 
@@ -202,8 +204,15 @@ def _schedule_ortools(
     if not job_vars:
         return {}
 
-    # Çakışma yasağı
-    model.AddNoOverlap([v["interval"] for v in job_vars.values()])
+    # Çakışma yasağı — taşınabilir işler + sabit engeller (çalışan/sabitlenmiş işler)
+    all_intervals = [v["interval"] for v in job_vars.values()]
+    for k, (f_start, f_dur) in enumerate(fixed_intervals or []):
+        f_start = max(0, min(int(f_start), n_slots))
+        f_dur = max(0, min(int(f_dur), n_slots - f_start))
+        if f_dur <= 0:
+            continue
+        all_intervals.append(model.NewFixedSizeIntervalVar(f_start, f_dur, f"fixed_{k}"))
+    model.AddNoOverlap(all_intervals)
 
     # Amaç: toplam karbonu minimize et (önceliğe göre ağırlıklı)
     obj = []
@@ -274,14 +283,34 @@ def _schedule_greedy(
     current_intensity: float,
     outage_slots: set | None = None,
     current_ptf: float | None = None,
+    fixed_intervals: list[tuple[int, int]] | None = None,
 ) -> dict[int, OptimalWindow]:
     _INF = datetime.max.replace(tzinfo=TURKEY_TZ)
+
+    def _parse_deadline(value) -> datetime | None:
+        if not value:
+            return None
+        d = value
+        if isinstance(d, str):
+            try:
+                d = datetime.fromisoformat(d)
+            except Exception:
+                return None
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=TURKEY_TZ)
+        return d
+
     sorted_jobs = sorted(
         jobs,
-        key=lambda j: (-j.get("priority", 1), j.get("deadline") or _INF),
+        key=lambda j: (-j.get("priority", 1), _parse_deadline(j.get("deadline")) or _INF),
     )
 
+    # Sabit engellerin kapladığı slotları en baştan dolu say
     used_slots: set[datetime] = set()
+    for f_start, f_dur in fixed_intervals or []:
+        for i in range(int(f_start), int(f_start) + int(f_dur)):
+            if 0 <= i < len(forecast.points):
+                used_slots.add(forecast.points[i].timestamp)
     results: dict[int, OptimalWindow] = {}
 
     for job in sorted_jobs:
@@ -294,7 +323,7 @@ def _schedule_greedy(
             window = find_optimal_window(
                 forecast=filtered,
                 duration_hours=job["duration_hours"],
-                deadline=job.get("deadline"),
+                deadline=_parse_deadline(job.get("deadline")),
                 power_kw=job["power_kw"],
                 current_intensity=current_intensity,
                 cost_weight=job.get("cost_weight", 0.0),

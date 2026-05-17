@@ -49,6 +49,7 @@ def _row_to_job_response(row: dict) -> JobResponse:
         priority=row["priority"],
         power_kw=row["power_kw"],
         status=row["status"],
+        pinned=bool(row.get("pinned")),
         created_at=datetime.fromisoformat(row["created_at"]),
         scheduled_start=datetime.fromisoformat(row["scheduled_start"]) if row.get("scheduled_start") else None,
         optimal_window=optimal_window,
