@@ -301,9 +301,11 @@ Tam interaktif dokümantasyon: `/docs`
 
 | İsim | Rol |
 |------|-----|
-| H. Arda Celep | Tech Lead |
-| *(ekip üyesi)* | *(rol)* |
-| *(ekip üyesi)* | *(rol)* |
+| Hüseyin Arda Celep | Backend Developer |
+| Kaan Yıldız | Frontend Developer |
+| Lamia Ucun | Ürün Yöneticisi |
+| Ayşenur Demir | Tasarımcı |
+| Ahmet Eren Çimen | İş Geliştirmeci |
 
 ---
 
