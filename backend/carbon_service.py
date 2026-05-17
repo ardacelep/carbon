@@ -36,6 +36,18 @@ EMISSION_FACTORS: dict[str, float] = {
 
 RENEWABLE_SOURCES: set[str] = {"dammedHydro", "river", "wind", "sun", "geothermal", "biomass"}
 
+# Ham yakıt adlarını ekranda gösterilen kategorilere gruplar — enerji dağılımı
+# grafiği karbon yoğunluğuyla aynı veriden beslensin diye TÜM yakıtları kapsar.
+FUEL_GROUPS: dict[str, tuple[str, ...]] = {
+    "Doğalgaz":  ("naturalGas", "lng"),
+    "Kömür":     ("lignite", "importCoal", "blackCoal", "asphaltiteCoal"),
+    "Hidrolik":  ("dammedHydro", "river"),
+    "Rüzgar":    ("wind",),
+    "Güneş":     ("sun",),
+    "Jeotermal": ("geothermal",),
+    "Diğer":     ("fueloil", "naphta", "biomass", "wasteheat", "importExport"),
+}
+
 SOLAR_CURVE: dict[int, float] = {
     0: 0.0,  1: 0.0,  2: 0.0,  3: 0.0,  4: 0.0,  5: 0.0,
     6: 0.02, 7: 0.10, 8: 0.25, 9: 0.45, 10: 0.65, 11: 0.82,
@@ -114,13 +126,21 @@ def calculate_carbon_intensity(gen_row: dict) -> dict:
             renewable_mwh += mwh
 
     if total_mwh == 0:
-        return {"carbon_intensity": 0.0, "renewable_ratio": 0.0, "total_mwh": 0.0}
+        return {"carbon_intensity": 0.0, "renewable_ratio": 0.0, "total_mwh": 0.0, "fuel_mix": None}
+
+    fuel_mix = {}
+    for label, fuels in FUEL_GROUPS.items():
+        group_mwh = sum(max(0.0, float(gen_row.get(f) or 0.0)) for f in fuels)
+        pct = round(group_mwh / total_mwh * 100, 1)
+        if pct > 0:
+            fuel_mix[label] = pct
 
     return {
         "timestamp": gen_row.get("date"),
         "carbon_intensity": round(total_co2 / total_mwh, 1),
         "renewable_ratio": round(renewable_mwh / total_mwh, 3),
         "total_mwh": round(total_mwh, 1),
+        "fuel_mix": fuel_mix,
     }
 
 
@@ -214,6 +234,8 @@ def _generate_mock_current() -> CarbonReading:
         carbon_intensity=calc["carbon_intensity"],
         renewable_ratio=calc["renewable_ratio"],
         source="mock",
+        fuel_mix=calc.get("fuel_mix"),
+        total_generation_mw=calc.get("total_mwh"),
     )
 
 
@@ -273,6 +295,8 @@ def _fetch_current_live() -> CarbonReading:
         carbon_intensity=validated,
         renewable_ratio=calc["renewable_ratio"],
         source="epias",
+        fuel_mix=calc.get("fuel_mix"),
+        total_generation_mw=calc.get("total_mwh"),
     )
 
 

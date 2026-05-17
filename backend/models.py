@@ -10,6 +10,12 @@ class CarbonReading(BaseModel):
     carbon_intensity: float = Field(..., description="gCO2eq/kWh")
     renewable_ratio: float = Field(..., ge=0.0, le=1.0)
     source: str = Field(default="epias", description="'epias' veya 'mock'")
+    fuel_mix: Optional[dict] = Field(
+        default=None, description="Gruplanmış yakıt dağılımı (kategori → %)"
+    )
+    total_generation_mw: Optional[float] = Field(
+        default=None, description="Toplam anlık üretim (MW)"
+    )
 
 
 class ForecastPoint(BaseModel):
@@ -192,6 +198,7 @@ class SavingsSummary(BaseModel):
     total_carbon_saved_kg: float
     total_energy_kwh: float
     avg_carbon_intensity: float
+    avg_savings_pct: float = 0.0
     best_saving_pct: float
     total_cost_saved_tl: Optional[float] = None
     period_start: Optional[datetime]
@@ -206,6 +213,8 @@ class CurrentCarbonResponse(BaseModel):
     timestamp: datetime
     source: str
     updated_minutes_ago: int
+    fuel_mix: Optional[dict] = None
+    total_generation_mw: Optional[float] = None
 
 
 # --- Auth ---

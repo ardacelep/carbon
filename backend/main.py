@@ -189,6 +189,8 @@ async def current_carbon():
         timestamp=reading.timestamp,
         source=reading.source,
         updated_minutes_ago=minutes_ago,
+        fuel_mix=reading.fuel_mix,
+        total_generation_mw=reading.total_generation_mw,
     )
 
 
@@ -711,7 +713,7 @@ async def savings_summary(ctx: UserContext = Depends(get_current_user)):
     if not rows:
         return SavingsSummary(
             total_jobs=0, optimized_jobs=0, total_carbon_saved_kg=0.0,
-            total_energy_kwh=0.0, avg_carbon_intensity=0.0,
+            total_energy_kwh=0.0, avg_carbon_intensity=0.0, avg_savings_pct=0.0,
             best_saving_pct=0.0, period_start=None, period_end=None,
         )
 
@@ -733,6 +735,9 @@ async def savings_summary(ctx: UserContext = Depends(get_current_user)):
     )
     best_saving_pct = max((r["estimated_savings_pct"] or 0.0 for r in optimized), default=0.0)
 
+    savings_pcts = [r["estimated_savings_pct"] for r in optimized if r.get("estimated_savings_pct") is not None]
+    avg_savings_pct = round(sum(savings_pcts) / len(savings_pcts), 1) if savings_pcts else 0.0
+
     created_dates = [datetime.fromisoformat(r["created_at"]) for r in rows]
 
     tl_vals = [r["estimated_savings_tl"] for r in optimized if r.get("estimated_savings_tl")]
@@ -744,6 +749,7 @@ async def savings_summary(ctx: UserContext = Depends(get_current_user)):
         total_carbon_saved_kg=round(total_carbon_saved_kg, 3),
         total_energy_kwh=round(total_energy_kwh, 2),
         avg_carbon_intensity=round(avg_carbon, 1),
+        avg_savings_pct=avg_savings_pct,
         best_saving_pct=round(best_saving_pct, 1),
         total_cost_saved_tl=total_cost_saved_tl,
         period_start=min(created_dates),

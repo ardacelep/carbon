@@ -81,7 +81,12 @@ def _get_client() -> AsyncOpenAI:
 _ALLOWED_TOOLS = {t["function"]["name"] for t in TOOLS}
 
 
-async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -> dict:
+async def _execute_tool(
+    name: str,
+    arguments: str,
+    user_id: str | None = None,
+    propose_only: bool = False,
+) -> dict:
     if name not in _ALLOWED_TOOLS:
         return {"error": f"İzinsiz araç: {name}"}
     args = json.loads(arguments or "{}")
@@ -168,13 +173,9 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
         }
 
     if name == "create_job":
-        if not user_id:
-            return {"error": "Kullanıcı kimliği doğrulanamadı, iş oluşturulamadı"}
         from carbon_service import get_current_carbon, get_forecast
         from scheduler import find_optimal_window
-        from database import create_job as db_create_job
-        from models import JobCreate
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime
 
         duration = max(0.5, float(args.get("duration_hours", 1)))
         pw = resolve_power_kw(args.get("name"), args.get("power_kw"), args.get("workload_type"))
@@ -195,6 +196,38 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
         except ValueError:
             window = None
 
+        window_dict = None
+        if window:
+            window_dict = {
+                "start_time": window.start_time.strftime("%d.%m %H:%M"),
+                "end_time": window.end_time.strftime("%H:%M"),
+                "avg_carbon_intensity": window.avg_carbon_intensity,
+                "estimated_savings_pct": window.estimated_savings_pct,
+                "estimated_savings_tl": window.estimated_savings_tl,
+                "reasoning": window.reasoning,
+            }
+
+        # Sohbet akışında iş DB'ye yazılmaz — kullanıcı onayına öneri olarak sunulur.
+        if propose_only:
+            return {
+                "proposed": True,
+                "name": args.get("name", "Yeni İş"),
+                "duration_hours": duration,
+                "power_kw": power,
+                "workload_type": pw["workload_type"],
+                "workload_label": pw["label"],
+                "power_source": pw["source"],
+                "priority": priority,
+                "cost_weight": cost_weight,
+                "deadline": deadline.isoformat() if deadline else None,
+                "optimal_window": window_dict,
+            }
+
+        if not user_id:
+            return {"error": "Kullanıcı kimliği doğrulanamadı, iş oluşturulamadı"}
+        from database import create_job as db_create_job
+        from models import JobCreate
+
         job = JobCreate(
             name=args.get("name", "Yeni İş"),
             duration_hours=duration,
@@ -213,18 +246,8 @@ async def _execute_tool(name: str, arguments: str, user_id: str | None = None) -
             "workload_type": pw["workload_type"],
             "workload_label": pw["label"],
             "power_source": pw["source"],
+            "optimal_window": window_dict,
         }
-        if window:
-            result["optimal_window"] = {
-                "start_time": window.start_time.strftime("%d.%m %H:%M"),
-                "end_time": window.end_time.strftime("%H:%M"),
-                "avg_carbon_intensity": window.avg_carbon_intensity,
-                "estimated_savings_pct": window.estimated_savings_pct,
-                "estimated_savings_tl": window.estimated_savings_tl,
-                "reasoning": window.reasoning,
-            }
-        else:
-            result["optimal_window"] = None
         return result
 
     return {"error": f"Bilinmeyen araç: {name}"}
@@ -270,7 +293,10 @@ _SYSTEM_PROMPT = (
     "create_job kullan. Sadece analiz veya öneri istiyorsa find_best_window yeterli.\n"
     "- Kullanıcı virgülle ayrılmış BİRDEN FAZLA iş adı veriyorsa, her iş için create_job'ı "
     "AYRI AYRI çağır. Tüm işler tamamlanana kadar durma, yanıt yazma.\n"
-    "- İşleri oluşturduktan sonra hangi işlerin hangi zaman penceresine eklendiğini ve "
+    "- ÖNEMLİ: create_job aracı işi DOĞRUDAN takvime KAYDETMEZ; sadece hesaplayıp "
+    "kullanıcının onayına ÖNERİ olarak sunar. Yanıtında 'eklendi', 'takvime alındı' DEME — "
+    "'önerildi', 'onayınıza sunuldu', 'onaylarsanız planlanacak' gibi ifadeler kullan.\n"
+    "- İşleri önerdikten sonra hangi işin hangi zaman penceresine önerildiğini ve "
     "beklenen CO₂ tasarrufu yüzdesini Türkçe özetle.\n\n"
     "cost_weight parametresi: 0.0=sadece karbon optimize et (varsayılan), "
     "0.5=karbon ve elektrik maliyetini dengele, 1.0=sadece maliyeti minimize et.\n\n"
@@ -314,11 +340,12 @@ async def get_chat_response_with_tools(
     message: str,
     history: list[dict],
     user_id: str | None = None,
-) -> tuple[str, bool]:
+    propose_only: bool = False,
+) -> tuple[str, list[dict]]:
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
     messages += history[-6:]
     messages.append({"role": "user", "content": message})
-    jobs_created = False
+    proposals: list[dict] = []
 
     try:
         for _ in range(8):
@@ -339,9 +366,10 @@ async def get_chat_response_with_tools(
                         tool_call.function.name,
                         tool_call.function.arguments,
                         user_id=user_id,
+                        propose_only=propose_only,
                     )
-                    if tool_call.function.name == "create_job" and "job_id" in result:
-                        jobs_created = True
+                    if tool_call.function.name == "create_job" and result.get("proposed"):
+                        proposals.append(result)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -360,12 +388,12 @@ async def get_chat_response_with_tools(
                         ),
                     })
                     continue
-                return content, jobs_created
+                return content, proposals
 
     except Exception as e:
         print(f"[llm_service] tool-calling hatası: {e}")
 
-    return "Şu anda yapay zeka servisi kullanılamıyor. Lütfen daha sonra tekrar deneyin.", jobs_created
+    return "Şu anda yapay zeka servisi kullanılamıyor. Lütfen daha sonra tekrar deneyin.", proposals
 
 
 async def get_chat_response(
@@ -375,7 +403,9 @@ async def get_chat_response(
     grid_context: dict | None = None,
     user_id: str | None = None,
 ) -> str:
-    reply, _ = await get_chat_response_with_tools(message, history, user_id=user_id)
+    reply, _ = await get_chat_response_with_tools(
+        message, history, user_id=user_id, propose_only=False
+    )
     return reply
 
 
@@ -387,7 +417,9 @@ async def stream_chat_response(
     user_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
     try:
-        reply, jobs_created = await get_chat_response_with_tools(message, history, user_id=user_id)
+        reply, proposals = await get_chat_response_with_tools(
+            message, history, user_id=user_id, propose_only=True
+        )
     except Exception as e:
         print(f"[llm_service] streaming hatası: {e}")
         yield f"data: {json.dumps({'error': 'Yapay zeka servisi şu anda kullanılamıyor.'})}\n\n"
@@ -397,8 +429,8 @@ async def stream_chat_response(
     for word in reply.split(" "):
         yield f"data: {json.dumps({'token': word + ' '})}\n\n"
 
-    if jobs_created:
-        yield f"data: {json.dumps({'jobs_changed': True})}\n\n"
+    if proposals:
+        yield f"data: {json.dumps({'proposal': proposals}, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
 
